@@ -1,0 +1,14 @@
+site_name: AutoMapConverter
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Conversion Workflows: conversion_workflows.md
+  - Conversion Rules: conversion_rules.md
+  - Python API: api.md
+  - CLI: cli.md
+  - Validation: diagnostics.md
+  - Runtime and Regression: runtime.md
+  - Examples: examples.md
+  - Development: development.md

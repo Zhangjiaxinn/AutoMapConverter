@@ -1,0 +1,2 @@
+recursive-include src/automap_converter *.yaml *.yml *.json *.xsd *.zip
+include LICENSE.txt NOTICE.md

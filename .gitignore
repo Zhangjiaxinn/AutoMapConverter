@@ -1,0 +1,37 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.smoke/
+*.egg-info/
+build/
+dist/
+
+# Generated conversion artifacts and diagnostics
+output/
+batch_results/
+roundtrip_results/
+preprocessed_sources/
+target_repairs/
+intermediate_commonroad/
+*_diagnostics.txt
+*_diagnostics.json
+*_asam_qc_result.xqar
+*_source_odrplot.csv
+*.patch
+
+# Sample maps are tracked and automatically exercised by CI.
+# Do not place private, restricted, or impractically large maps here.
+data/results/*
+!data/results/README.md
+
+# Secrets and editor state
+.env
+.env.*
+*.code-workspace
+.idea/
+.vscode/

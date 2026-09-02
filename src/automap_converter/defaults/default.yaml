@@ -1,0 +1,11 @@
+# Default runtime settings for AutoMapConverter.
+conversion:
+  lanelet2_routing_enrichment: true
+  osm_extract_sublayer: true
+  opendrive_version: "1.6.1"
+stage1:
+  launch_viewer: false
+diagnostics:
+  target_conformance: true
+  topology: true
+  source_element_mapping: true

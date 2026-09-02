@@ -1,0 +1,6 @@
+stage1:
+  launch_viewer: false
+diagnostics:
+  target_conformance: true
+  topology: true
+  source_element_mapping: true

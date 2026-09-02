@@ -1,0 +1,44 @@
+name: quality-gate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Compile packaged source
+        run: python -m compileall -q src/automap_converter
+      - name: Run unit tests
+        run: pytest tests/unit
+      - name: Smoke-test the installed command-line interface
+        run: automap-converter --help
+
+  map-regression:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build reproducible map-conversion runtime
+        run: docker build --tag automap-converter:ci .
+      - name: Run all sample-map conversion regressions
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/workspace"
+          --workdir /workspace
+          automap-converter:ci
+          python scripts/run_regression.py --output-dir data/results/ci
+      - name: Upload conversion maps and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sample-map-regression
+          path: data/results/ci
+          if-no-files-found: warn

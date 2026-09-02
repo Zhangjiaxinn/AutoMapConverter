@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automap-converter"
+version = "0.1.0"
+description = "Vector-map conversion and diagnostics for autonomous-driving workflows."
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "AutoMapConverter contributors" }]
+keywords = ["autonomous-driving", "lanelet2", "opendrive", "osm", "map-conversion"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "antlr4-python3-runtime==4.9.3",
+    "commonroad-clcs>=2025.1",
+    "commonroad-drivability-checker>=2025.1,<2026.0",
+    "commonroad-io>=2024.2,<=2024.3",
+    "iso3166>=2.1.1,<3.0.0",
+    "kdtree>=0.16,<0.17",
+    "lanelet2==1.2.2",
+    "lxml>=6.0.2,<7.0.0",
+    "matplotlib>=3.6.0",
+    "mgrs>=1.4.5",
+    "networkx>=3.0,<4.0",
+    "numpy>=1.26.1",
+    "omegaconf>=2.3.0,<3.0.0",
+    "ordered-set>=4.1.0,<5.0.0",
+    "pandas>=2.0.2,<3.0.0",
+    "pyclothoids>=0.1.5,<0.2.0",
+    "pygeodesy>=23.3.23,<24.0.0",
+    "pymetis>=2020.1",
+    "pyproj>=3.4.1,<4.0.0",
+    "PyYAML>=6.0,<7.0.0",
+    "requests>=2.31.0,<3.0.0",
+    "scipy>=1.11.3",
+    "shapely>=2.0.1",
+    "typing-extensions>=4.8.0,<5.0.0",
+    "urllib3>=2.0.3,<3.0.0",
+    "utm>=0.7.0,<0.8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.2", "ruff>=0.6"]
+docs = ["mkdocs-material>=9.5", "mkdocstrings[python]>=0.25"]
+
+[project.scripts]
+automap-converter = "automap_converter.cli:main"
+
+[project.urls]
+Source = "https://github.com/REPLACE_WITH_OWNER/AutoMapConverter"
+Issues = "https://github.com/REPLACE_WITH_OWNER/AutoMapConverter/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["automap_converter*"]
+
+[tool.setuptools.package-data]
+automap_converter = ["**/*.yaml", "**/*.yml", "**/*.json", "**/*.xsd", "**/*.zip"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
