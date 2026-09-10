@@ -1,0 +1,31 @@
+services:
+  automap-service:
+    image: cicv/automap-service:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+    restart: unless-stopped
+    init: true
+    environment:
+      AUTOMAP_SERVICE_TOKEN: ${AUTOMAP_SERVICE_TOKEN:?Set service authentication token}
+      AUTOMAP_STORAGE_HOSTS: ${AUTOMAP_STORAGE_HOSTS:?Set exact internal S3 hostname}
+    volumes:
+      - automap-jobs:/var/lib/automap
+    networks:
+      - platform
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+networks:
+  platform:
+    external: true
+    name: cicv-platform
+volumes:
+  automap-jobs:

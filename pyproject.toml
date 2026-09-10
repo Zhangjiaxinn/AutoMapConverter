@@ -49,6 +49,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+service = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
 dev = ["pytest>=7.2", "ruff>=0.6"]
 docs = ["mkdocs-material>=9.5", "mkdocstrings[python]>=0.25"]
 
@@ -61,7 +62,7 @@ Issues = "https://github.com/REPLACE_WITH_OWNER/AutoMapConverter/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["automap_converter*"]
+include = ["automap_converter*", "automap_service*"]
 
 [tool.setuptools.package-data]
 automap_converter = ["**/*.yaml", "**/*.yml", "**/*.json", "**/*.xsd", "**/*.zip"]
