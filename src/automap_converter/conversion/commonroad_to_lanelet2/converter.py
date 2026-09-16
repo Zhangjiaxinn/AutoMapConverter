@@ -518,8 +518,10 @@ class CR2LaneletConverter:
                                     append_unique(yield_ways, sign_yield_ways)
                                     append_unique(right_of_ways, sign_right_of_ways)
                                     append_unique(ref_line, sign_ref_lines)
-        # do not add right_of_way_rel if there are no signs
-        if len(refers) > 0:
+        # Lanelet2 rejects a right_of_way regulatory element without at least
+        # one lanelet that actually has right of way. Keep unmatched signs as
+        # standalone primitives instead of emitting an unloadable relation.
+        if refers and right_of_ways:
             regulatory_id = str(self.id_count)
             self.osm.add_regulatory_element(
                 RegulatoryElement(

@@ -1,7 +1,7 @@
 FROM python:3.10-slim-bookworm
 
 LABEL org.opencontainers.image.title="AutoMapConverter"
-LABEL org.opencontainers.image.description="Reproducible vector-map conversion and regression environment"
+LABEL org.opencontainers.image.description="Reproducible vector and raster map-conversion environment"
 
 ARG ESMINI_VERSION=3.6.0
 ARG ASAM_QC_OPENDRIVE_VERSION=1.0.0

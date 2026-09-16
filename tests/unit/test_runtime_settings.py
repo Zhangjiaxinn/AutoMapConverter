@@ -26,6 +26,9 @@ diagnostics:
     assert settings.lanelet2_routing_enrichment is False
     assert settings.osm_extract_sublayer is False
     assert settings.opendrive_version == "1.5"
+    assert settings.raster_resolution_m == 0.5
+    assert settings.raster_padding_m == 5.0
+    assert settings.raster_supersampling == 4
     assert settings.launch_viewer is True
     assert settings.diagnose_target_conformance is False
     assert settings.diagnose_topology is True

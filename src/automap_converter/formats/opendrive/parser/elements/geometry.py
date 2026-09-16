@@ -130,6 +130,9 @@ class Arc(Geometry):
         :return: x and y position, orientation and curvature in the form ([x, y], orientation, curvature=0)
         """
         c = self.curvature
+        if np.isclose(c, 0):
+            direction = np.array([np.cos(self.heading), np.sin(self.heading)])
+            return self.start_position + s_pos * direction, self.heading, 0.0
         hdg = self.heading - np.pi / 2
 
         a = 2 / c * np.sin(s_pos * c / 2)

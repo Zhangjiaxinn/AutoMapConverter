@@ -176,6 +176,7 @@ class Lanelet2OSMConverter:
         endpoint_extension_insert_spacing_sample_points: int = 6,
         endpoint_extension_max_insert_points: int = 20,
         endpoint_extension_debug_examples: int = 0,
+        endpoint_extension_max_draft_ways: int = 1200,
         debug_output_path: Optional[str] = None,
     ):
         self._config = config
@@ -229,6 +230,11 @@ class Lanelet2OSMConverter:
         self.endpoint_extension_insert_spacing_sample_points = max(1, int(endpoint_extension_insert_spacing_sample_points))
         self.endpoint_extension_max_insert_points = max(0, int(endpoint_extension_max_insert_points))
         self.endpoint_extension_debug_examples = max(0, int(endpoint_extension_debug_examples))
+        # Endpoint extension compares every dangling endpoint against every
+        # draft way. It is useful around small intersections, but its cost
+        # grows rapidly on city-scale maps. Zero explicitly disables the limit.
+        self.endpoint_extension_max_draft_ways = max(0, int(endpoint_extension_max_draft_ways))
+        self.endpoint_extension_skip_reason = ""
 
         self._source: Optional[Lanelet2Map] = None
         self._out: Optional[OSM] = None
@@ -875,16 +881,34 @@ class Lanelet2OSMConverter:
         way = self._source.find_way_by_id(str(way_id))
         if way is None:
             return None
-        points = []
+        lat_lon_points: List[Tuple[float, float]] = []
+        xy_points: List[Tuple[float, float]] = []
         for node_id in way.nodes:
             node = self._source.find_node_by_id(str(node_id))
             if node is not None:
-                points.append(self._node_xy(node))
-        if not points:
+                lat = self._safe_float(getattr(node, "lat", None), None)
+                lon = self._safe_float(getattr(node, "lon", None), None)
+                if (
+                    lat is not None
+                    and lon is not None
+                    and math.isfinite(lat)
+                    and math.isfinite(lon)
+                    and -90.0 <= lat <= 90.0
+                    and -180.0 <= lon <= 180.0
+                ):
+                    lat_lon_points.append((lat, lon))
+                else:
+                    xy_points.append(self._node_xy(node))
+        if lat_lon_points:
+            return (
+                sum(point[0] for point in lat_lon_points) / len(lat_lon_points),
+                sum(point[1] for point in lat_lon_points) / len(lat_lon_points),
+            )
+        if not xy_points:
             return None
         xy = (
-            sum(point[0] for point in points) / len(points),
-            sum(point[1] for point in points) / len(points),
+            sum(point[0] for point in xy_points) / len(xy_points),
+            sum(point[1] for point in xy_points) / len(xy_points),
         )
         return self._xy_to_latlon_if_needed(xy)
 
@@ -1080,10 +1104,8 @@ class Lanelet2OSMConverter:
     def _xy_to_latlon_if_needed(self, xy: Tuple[float, float]) -> Tuple[float, float]:
         """Convert local metric XY back to lat/lon for newly generated auxiliary features."""
         if self._xy_origin_lat is None or self._xy_origin_lon is None:
-            # This should only happen for inputs with explicit local_x/local_y but
-            # no projection origin.  Fall back to treating xy as lon/lat-like to
-            # avoid crashing; normal Lanelet2 maps provide lat/lon nodes.
-            return xy[1], xy[0]
+            self._xy_origin_lat = 0.0
+            self._xy_origin_lon = 0.0
         lat = self._xy_origin_lat + xy[1] / self._xy_m_per_deg_lat
         lon = self._xy_origin_lon + xy[0] / self._xy_m_per_deg_lon
         return lat, lon
@@ -3160,6 +3182,21 @@ class Lanelet2OSMConverter:
         """
         if not self.endpoint_extension_enabled:
             return 0
+        if (
+            self.endpoint_extension_max_draft_ways
+            and len(draft_ways) > self.endpoint_extension_max_draft_ways
+        ):
+            self.endpoint_extension_skip_reason = (
+                "draft_way_count_exceeds_limit"
+            )
+            LOGGER.info(
+                "Lanelet2OSMConverter: skipped endpoint extension for %d draft ways "
+                "(limit=%d); preserving existing topology without the expensive "
+                "geometric intersection refinement.",
+                len(draft_ways),
+                self.endpoint_extension_max_draft_ways,
+            )
+            return 0
         assert self._node_id_gen is not None
 
         stats: Dict[str, int] = defaultdict(int)
@@ -4975,8 +5012,15 @@ class Lanelet2OSMConverter:
             node = self._source.find_node_by_id(node_id)
             if node is None:
                 continue
-            xy.append(self._node_xy(node))
-            ll.append((self._safe_float(node.lat), self._safe_float(node.lon)))
+            point_xy = self._node_xy(node)
+            xy.append(point_xy)
+            lat = self._safe_float(node.lat, None)
+            lon = self._safe_float(node.lon, None)
+            ll.append(
+                (lat, lon)
+                if lat is not None and lon is not None
+                else self._xy_to_latlon_if_needed(point_xy)
+            )
             ele.append(self._safe_float(getattr(node, "ele", 0.0)))
         return {"xy": xy, "ll": ll, "ele": ele}
 
@@ -5101,10 +5145,14 @@ class Lanelet2OSMConverter:
     # Primitive / format helpers
     # ------------------------------------------------------------------
     def _make_osm_node_from_source(self, source_node: Lanelet2Node) -> OSMNode:
+        lat = self._safe_float(source_node.lat, None)
+        lon = self._safe_float(source_node.lon, None)
+        if lat is None or lon is None:
+            lat, lon = self._xy_to_latlon_if_needed(self._node_xy(source_node))
         return OSMNode(
             id_=source_node.id_,
-            lat=self._format_float(self._safe_float(source_node.lat)),
-            lon=self._format_float(self._safe_float(source_node.lon)),
+            lat=self._format_float(lat),
+            lon=self._format_float(lon),
             ele=self._format_float(self._safe_float(getattr(source_node, "ele", 0.0))),
             tag_dict={},
         )
@@ -5176,6 +5224,13 @@ class Lanelet2OSMConverter:
                 self._xy_m_per_deg_lon,
             )
             return
+        self._xy_origin_lat = 0.0
+        self._xy_origin_lon = 0.0
+        LOGGER.warning(
+            "Lanelet2OSMConverter: source has local XY but no geographic reference; "
+            "using a synthetic WGS84 origin at 0,0. Relative geometry is preserved, "
+            "but the absolute location is unknown."
+        )
 
     def _latlon_to_metric_xy(self, lat: float, lon: float) -> Tuple[float, float]:
         if self._xy_origin_lat is None or self._xy_origin_lon is None:

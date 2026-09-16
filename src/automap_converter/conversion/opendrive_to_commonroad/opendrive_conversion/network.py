@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import iso3166
 import numpy as np
-from commonroad.scenario.area import Area, AreaBorder
 from commonroad.scenario.lanelet import (
     Lanelet,
     LaneletNetwork,
@@ -769,6 +768,23 @@ class Network:
         return "ZAM"
 
 
+def _incoming_junction_lane_section_index(road, junction_id: int, fallback: int) -> int:
+    """Return the road end that is physically attached to a junction."""
+
+    candidates = (
+        (getattr(road.link, "successor", None), road.lanes.get_last_lane_section_idx()),
+        (getattr(road.link, "predecessor", None), 0),
+    )
+    for link, section_index in candidates:
+        if (
+            link is not None
+            and link.elementType == "junction"
+            and str(link.element_id) == str(junction_id)
+        ):
+            return section_index
+    return fallback
+
+
 class LinkIndex:
     """Overall index of all links in the file, save everything as successors, predecessors can be
     found via a reverse search"""
@@ -950,14 +966,22 @@ class LinkIndex:
                 contact_point = connection.contactPoint
 
                 for lane_link in connection.laneLinks:
+                    fallback_incoming_section = (
+                        incoming_road.lanes.get_last_lane_section_idx()
+                        if contact_point == "start" and lane_link.fromId < 0
+                        else 0
+                    )
+                    incoming_section_idx = _incoming_junction_lane_section_index(
+                        incoming_road,
+                        junction.id,
+                        fallback_incoming_section,
+                    )
                     if contact_point == "start":
-                        # decide which lane section to use (first or last)
-                        if lane_link.fromId < 0:
-                            lane_section_idx = incoming_road.lanes.get_last_lane_section_idx()
-                        else:
-                            lane_section_idx = 0
                         incoming_road_id = encode_road_section_lane_width_id(
-                            incoming_road.id, lane_section_idx, lane_link.fromId, -1
+                            incoming_road.id,
+                            incoming_section_idx,
+                            lane_link.fromId,
+                            -1,
                         )
                         connecting_road_id = encode_road_section_lane_width_id(
                             connecting_road.id, 0, lane_link.toId, -1
@@ -977,7 +1001,10 @@ class LinkIndex:
 
                     else:
                         incoming_road_id = encode_road_section_lane_width_id(
-                            incoming_road.id, 0, lane_link.fromId, -1
+                            incoming_road.id,
+                            incoming_section_idx,
+                            lane_link.fromId,
+                            -1,
                         )
                         connecting_road_id = encode_road_section_lane_width_id(
                             connecting_road.id,

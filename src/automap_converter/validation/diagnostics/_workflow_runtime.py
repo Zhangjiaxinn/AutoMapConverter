@@ -5,7 +5,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -37,9 +36,15 @@ from automap_converter.api.interface import (  # noqa: E402
     osm_to_commonroad,
 )
 from automap_converter.api.settings import current_runtime_settings  # noqa: E402
+from automap_converter.api.result_layout import (  # noqa: E402
+    allocate_batch_run,
+    allocate_result_run,
+    write_result_manifest,
+)
 from .source_map_precheck import (  # noqa: E402
-    prepare_source_for_conversion,
-    repair_target_after_conversion,
+    detect_repairable_source_issues,
+    inspect_source_for_conversion,
+    prepare_source_if_needed,
 )
 from ._semantic_engine import diagnose_stage2  # noqa: E402
 
@@ -81,15 +86,15 @@ def _result_from_checks(checks: Sequence[Stage1Check]) -> str:
     return "UNKNOWN"
 
 
-def _raise_on_source_precheck_failure(records: Sequence[Dict[str, str]]) -> None:
+def _raise_on_source_validation_failure(records: Sequence[Dict[str, str]]) -> None:
     failures = [record for record in records if record.get("status") == "FAIL"]
     if not failures:
         return
     message = "; ".join(
-        f"{record.get('category', 'source-precheck')}: {record.get('summary', '')}"
+        f"{record.get('category', 'source-validation')}: {record.get('summary', '')}"
         for record in failures[:3]
     )
-    raise ValueError(f"Source map precheck failed: {message}")
+    raise ValueError(f"Source map validation failed: {message}")
 
 
 def _which(names: Sequence[str]) -> Optional[str]:
@@ -363,9 +368,9 @@ def write_stage1_report(
     elapsed: float,
     error: str = "",
     source_precheck: Optional[Sequence[Dict[str, str]]] = None,
+    prepared_source: Optional[Path] = None,
     conversion_notes: Optional[Sequence[Dict[str, str]]] = None,
-    target_repair: Optional[Sequence[Dict[str, str]]] = None,
-) -> Tuple[Path, Path, Dict[str, object]]:
+) -> Tuple[Path, Dict[str, object]]:
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     result = "ERROR" if error else _result_from_checks(checks)
     counts = _count_statuses(checks)
@@ -380,70 +385,56 @@ def write_stage1_report(
         "result": result,
         "summary": counts,
         "error": error,
-        "source_precheck": list(source_precheck or []),
-        "conversion_notes": list(conversion_notes or []),
-        "target_repair": list(target_repair or []),
-        "acceptance": [asdict(check) for check in checks],
+        "source_precheck": _non_pass_records(source_precheck),
+        "prepared_source": str(prepared_source) if prepared_source else "",
+        "conversion_notes": _non_pass_records(conversion_notes),
+        "acceptance": [asdict(check) for check in checks if check.status != "PASS"],
     }
     stem = target_path.stem
     json_path = diagnostics_dir / f"{stem}_stage1_diagnostics.json"
-    txt_path = diagnostics_dir / f"{stem}_stage1_diagnostics.txt"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return json_path, payload
 
-    lines = [
-        f"{conversion} Stage1 Acceptance Report",
-        "=" * 72,
-        f"Source: {_relative(source_path)}",
-        f"Target: {_relative(target_path)}",
-        f"Result: {result}",
-        (
-            f"PASS={counts['pass']} WARN={counts['warn']} FAIL={counts['fail']} "
-            f"REVIEW={counts['review']} SKIP={counts['skip']}"
-        ),
-    ]
-    if error:
-        lines.extend(["", "Conversion error:", error])
-    if source_precheck:
-        lines.append("")
-        lines.append("Source precheck / repair:")
-        for record in source_precheck:
-            lines.append(
-                f"[{record.get('status', 'UNKNOWN')}] {record.get('category', 'source-precheck')}: "
-                f"{record.get('summary', '')}"
-            )
-            if record.get("hint"):
-                lines.append(f"  hint: {record['hint']}")
-    if conversion_notes:
-        lines.append("")
-        lines.append("Conversion notes:")
-        for record in conversion_notes:
-            lines.append(
-                f"[{record.get('status', 'UNKNOWN')}] {record.get('category', 'conversion-note')}: "
-                f"{record.get('summary', '')}"
-            )
-            if record.get("hint"):
-                lines.append(f"  hint: {record['hint']}")
-    if target_repair:
-        lines.append("")
-        lines.append("Target postprocess / repair:")
-        for record in target_repair:
-            lines.append(
-                f"[{record.get('status', 'UNKNOWN')}] {record.get('category', 'target-repair')}: "
-                f"{record.get('summary', '')}"
-            )
-            if record.get("hint"):
-                lines.append(f"  hint: {record['hint']}")
-    lines.append("")
-    for check in checks:
-        lines.append(f"[{check.status}] {check.category}: {check.summary}")
-        if check.method:
-            lines.append(f"  method: {check.method}")
-        if check.target:
-            lines.append(f"  target: {check.target}")
-        if check.hint:
-            lines.append(f"  hint: {check.hint}")
-    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return txt_path, json_path, payload
+
+def _final_diagnostics_path(diagnostics_dir: Path, target_path: Path) -> Path:
+    """Return the single user-facing report path for one conversion run."""
+
+    return diagnostics_dir / f"{target_path.stem}_diagnostics.json"
+
+
+def _retain_stage1_as_final_report(
+    stage1_path: Path,
+    diagnostics_dir: Path,
+    target_path: Path,
+    *,
+    stage2_error: str = "",
+) -> Path:
+    """Promote a Stage 1 report when no combined report can be produced."""
+
+    final_path = _final_diagnostics_path(diagnostics_dir, target_path)
+    if stage2_error:
+        payload = json.loads(stage1_path.read_text(encoding="utf-8"))
+        payload["result"] = "ERROR"
+        payload["error"] = stage2_error
+        payload["stage2"] = {
+            "status": "FAIL",
+            "summary": "Stage 2 diagnostics raised an exception.",
+            "hint": stage2_error.splitlines()[-1] if stage2_error else "",
+        }
+        stage1_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    if stage1_path != final_path:
+        stage1_path.replace(final_path)
+    return final_path
+
+
+def _non_pass_records(
+    records: Optional[Sequence[Dict[str, str]]],
+) -> List[Dict[str, str]]:
+    """Keep run reports focused on actionable source and conversion records."""
+    return [record for record in records or [] if record.get("status") != "PASS"]
 
 
 def convert_opendrive_to_lanelet2(source_path: Path, target_path: Path, _: Path) -> None:
@@ -566,11 +557,40 @@ class ConversionSpec:
     target_suffix: str
     convert: Callable[[Path, Path, Path], Optional[List[Dict[str, str]]]]
     validate: Callable[[Path], List[Stage1Check]]
-    preprocess_source: Callable[[str, Path, Path], Tuple[Path, List[Dict[str, str]]]] = (
-        prepare_source_for_conversion
+    validate_source: Callable[[str, Path], List[Dict[str, str]]] = inspect_source_for_conversion
+
+
+def _prepare_source_input(
+    spec: ConversionSpec,
+    source_path: Path,
+    prepared_output_path: Path,
+) -> Tuple[Path, Optional[Path], List[Dict[str, str]]]:
+    """Validate first, then prepare a run-local copy only for detected issues."""
+    initial_validation = spec.validate_source(spec.name, source_path)
+    repair_candidates = detect_repairable_source_issues(spec.name, source_path)
+    if not repair_candidates:
+        _raise_on_source_validation_failure(initial_validation)
+        return source_path, None, initial_validation
+
+    prepared_path, repair_records = prepare_source_if_needed(
+        spec.name,
+        source_path,
+        prepared_output_path,
     )
-    postprocess_target: Callable[[str, Path, Path], List[Dict[str, str]]] = (
-        repair_target_after_conversion
+    prepared_source = prepared_path if prepared_path != source_path else None
+    effective_source = prepared_source or source_path
+    effective_validation = spec.validate_source(spec.name, effective_source)
+    repair_categories = {record.get("category", "") for record in repair_records}
+    compact_validation = [
+        record
+        for record in effective_validation
+        if record.get("category", "") not in repair_categories
+    ]
+    _raise_on_source_validation_failure(effective_validation)
+    return (
+        effective_source,
+        prepared_source,
+        repair_candidates + repair_records + compact_validation,
     )
 
 
@@ -585,23 +605,17 @@ def run_single(
     checks: List[Stage1Check] = []
     error = ""
     source_precheck: List[Dict[str, str]] = []
+    prepared_source: Optional[Path] = None
     conversion_notes: List[Dict[str, str]] = []
-    target_repair: List[Dict[str, str]] = []
     if intermediate_dir is None:
         intermediate_dir = target_path.parent / "intermediate_commonroad"
     try:
-        prepared_source, source_precheck = spec.preprocess_source(
-            spec.name,
+        effective_source, prepared_source, source_precheck = _prepare_source_input(
+            spec,
             source_path,
-            target_path.parent / "preprocessed_sources",
+            diagnostics_dir / f"{source_path.stem}_prepared{source_path.suffix}",
         )
-        _raise_on_source_precheck_failure(source_precheck)
-        conversion_notes = spec.convert(prepared_source, target_path, intermediate_dir) or []
-        target_repair = spec.postprocess_target(
-            spec.name,
-            target_path,
-            target_path.parent / "target_repairs",
-        )
+        conversion_notes = spec.convert(effective_source, target_path, intermediate_dir) or []
         checks = spec.validate(target_path)
     except Exception:
         error = traceback.format_exc()
@@ -614,7 +628,7 @@ def run_single(
             )
         ]
         print(f"ERROR: {error.splitlines()[-1] if error else 'unknown error'}")
-    txt_path, json_path, _ = write_stage1_report(
+    stage1_path, _ = write_stage1_report(
         diagnostics_dir,
         spec.name,
         source_path,
@@ -623,24 +637,35 @@ def run_single(
         time.time() - started,
         error=error,
         source_precheck=source_precheck,
+        prepared_source=prepared_source,
         conversion_notes=conversion_notes,
-        target_repair=target_repair,
     )
-    print(f"Stage1 report written to: {txt_path}")
-    print(f"Stage1 JSON written to: {json_path}")
     if not error:
-        stage1_payload = json.loads(json_path.read_text(encoding="utf-8"))
-        combined_txt, combined_json, _ = diagnose_stage2(
-            spec.name,
-            source_path,
-            target_path,
-            diagnostics_dir,
-            stage1_payload=stage1_payload,
-        )
-        print(f"Stage1+Stage2 report written to: {combined_txt}")
-        print(f"Stage1+Stage2 JSON written to: {combined_json}")
-        return combined_txt
-    return txt_path
+        try:
+            stage1_payload = json.loads(stage1_path.read_text(encoding="utf-8"))
+            combined_path, _ = diagnose_stage2(
+                spec.name,
+                prepared_source or source_path,
+                target_path,
+                diagnostics_dir,
+                stage1_payload=stage1_payload,
+            )
+        except Exception:
+            stage2_error = traceback.format_exc()
+            final_path = _retain_stage1_as_final_report(
+                stage1_path,
+                diagnostics_dir,
+                target_path,
+                stage2_error=stage2_error,
+            )
+            print(f"Diagnostics written to: {final_path}")
+            return final_path
+        stage1_path.unlink(missing_ok=True)
+        print(f"Diagnostics written to: {combined_path}")
+        return combined_path
+    final_path = _retain_stage1_as_final_report(stage1_path, diagnostics_dir, target_path)
+    print(f"Diagnostics written to: {final_path}")
+    return final_path
 
 
 def run_batch(spec: ConversionSpec, args: argparse.Namespace) -> Path:
@@ -654,37 +679,36 @@ def run_batch(spec: ConversionSpec, args: argparse.Namespace) -> Path:
     if not sources:
         raise FileNotFoundError(f"No {spec.source_suffix} files found in {source_dir}")
 
-    run_id = args.run_name or time.strftime("%Y%m%d_%H%M%S")
-    batch_dir = spec.output_root / run_id
-    output_dir = batch_dir / "output"
-    diagnostics_dir = batch_dir / "diagnostics"
-    intermediate_dir = batch_dir / "intermediate_commonroad"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    batch_dir = allocate_batch_run(spec.output_root, spec.name, args.run_name)
+    work_dir = batch_dir / "_work"
 
     rows: List[Dict[str, object]] = []
     for index, source_path in enumerate(sources, start=1):
         started = time.time()
-        target_path = output_dir / f"{source_path.stem}{spec.target_suffix}"
+        result_run = allocate_result_run(
+            spec.output_root,
+            spec.name,
+            source_path,
+            spec.target_suffix,
+        )
+        target_path = result_run.target
         print(f"[{index}/{len(sources)}] {spec.name}: {_relative(source_path)}")
         checks: List[Stage1Check] = []
         error = ""
         source_precheck: List[Dict[str, str]] = []
+        prepared_source: Optional[Path] = None
         conversion_notes: List[Dict[str, str]] = []
-        target_repair: List[Dict[str, str]] = []
         try:
-            prepared_source, source_precheck = spec.preprocess_source(
-                spec.name,
+            effective_source, prepared_source, source_precheck = _prepare_source_input(
+                spec,
                 source_path,
-                batch_dir / "preprocessed_sources",
+                result_run.directory / f"{source_path.stem}_prepared{source_path.suffix}",
             )
-            _raise_on_source_precheck_failure(source_precheck)
-            conversion_notes = spec.convert(prepared_source, target_path, intermediate_dir) or []
-            target_repair = spec.postprocess_target(
-                spec.name,
+            conversion_notes = spec.convert(
+                effective_source,
                 target_path,
-                batch_dir / "target_repairs",
-            )
+                work_dir / source_path.stem,
+            ) or []
             checks = spec.validate(target_path)
         except Exception:
             error = traceback.format_exc()
@@ -698,8 +722,8 @@ def run_batch(spec: ConversionSpec, args: argparse.Namespace) -> Path:
             ]
             print(f"  ERROR: {error.splitlines()[-1] if error else 'unknown error'}")
         elapsed = time.time() - started
-        txt_path, json_path, payload = write_stage1_report(
-            diagnostics_dir,
+        stage1_path, payload = write_stage1_report(
+            result_run.directory,
             spec.name,
             source_path,
             target_path,
@@ -707,15 +731,14 @@ def run_batch(spec: ConversionSpec, args: argparse.Namespace) -> Path:
             elapsed,
             error=error,
             source_precheck=source_precheck,
+            prepared_source=prepared_source,
             conversion_notes=conversion_notes,
-            target_repair=target_repair,
         )
         row = {
             "map": source_path.name,
             "source": _relative(source_path),
             "target": _relative(target_path),
-            "diagnostics_txt": _relative(txt_path),
-            "diagnostics_json": _relative(json_path),
+            "diagnostics": _relative(stage1_path),
             "result": payload["result"],
             "stage1_result": payload["result"],
             "stage1_pass": payload["summary"]["pass"],
@@ -734,16 +757,48 @@ def run_batch(spec: ConversionSpec, args: argparse.Namespace) -> Path:
         }
         if error:
             row["error"] = error.splitlines()[-1] if error.splitlines() else "conversion error"
-        else:
-            combined_txt, combined_json, combined_payload = diagnose_stage2(
-                spec.name,
-                source_path,
-                target_path,
-                diagnostics_dir,
-                stage1_payload=payload,
+            final_path = _retain_stage1_as_final_report(
+                stage1_path, result_run.directory, target_path
             )
-            row["diagnostics_txt"] = _relative(combined_txt)
-            row["diagnostics_json"] = _relative(combined_json)
+            row["diagnostics"] = _relative(final_path)
+            write_result_manifest(
+                result_run,
+                final_path,
+                elapsed_seconds=elapsed,
+                result="FAIL",
+            )
+        else:
+            try:
+                combined_path, combined_payload = diagnose_stage2(
+                    spec.name,
+                    prepared_source or source_path,
+                    target_path,
+                    result_run.directory,
+                    stage1_payload=payload,
+                )
+            except Exception:
+                stage2_error = traceback.format_exc()
+                final_path = _retain_stage1_as_final_report(
+                    stage1_path,
+                    result_run.directory,
+                    target_path,
+                    stage2_error=stage2_error,
+                )
+                row["diagnostics"] = _relative(final_path)
+                row["result"] = "FAIL"
+                row["stage2_result"] = "FAIL"
+                row["stage2_fail"] = 1
+                row["error"] = stage2_error.splitlines()[-1]
+                write_result_manifest(
+                    result_run,
+                    final_path,
+                    elapsed_seconds=elapsed,
+                    result="FAIL",
+                )
+                rows.append(row)
+                continue
+            stage1_path.unlink(missing_ok=True)
+            row["diagnostics"] = _relative(combined_path)
             row["result"] = combined_payload["result"]
             row["stage2_result"] = combined_payload["result"]
             row["stage2_pass"] = combined_payload["summary"]["pass"]
@@ -751,6 +806,12 @@ def run_batch(spec: ConversionSpec, args: argparse.Namespace) -> Path:
             row["stage2_fail"] = combined_payload["summary"]["fail"]
             row["stage2_review"] = combined_payload["summary"]["review"]
             row["stage2_skip"] = combined_payload["summary"]["skip"]
+            write_result_manifest(
+                result_run,
+                combined_path,
+                elapsed_seconds=elapsed,
+                result=str(combined_payload["result"]),
+            )
         rows.append(row)
 
     summary_path = batch_dir / "summary.txt"
@@ -760,6 +821,7 @@ def run_batch(spec: ConversionSpec, args: argparse.Namespace) -> Path:
         json.dumps(rows, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    shutil.rmtree(work_dir, ignore_errors=True)
     print(f"Batch summary written to: {summary_path}")
     return summary_path
 
@@ -824,8 +886,9 @@ def write_batch_summary(
             "Legend:",
             "  Stage1 checks target loadability/readability and visual-tool availability.",
             "  Stage2 checks target structure, reference/topology validity and source-element preservation.",
-            "  Lanelet2 target: lanelet2.io.load + RViz availability.",
-            "  OSM target: XML/OSM parse + optional osmium check-refs + JOSM/QGIS availability.",
+        "  Lanelet2 target: lanelet2.io.load + RViz availability.",
+        "  OSM target: XML/OSM parse + optional osmium check-refs + JOSM/QGIS availability.",
+        "  Raster target: GDAL/rasterio schema checks + generated PNG previews.",
             "  REVIEW means the visualization tool is available but manual visual comparison is still required.",
             "  SKIP means an optional external tool is not installed; it is not counted as conversion failure.",
             "  P2/W2/F2/R2/S2k = PASS/WARN/FAIL/REVIEW/SKIP counts for Stage2 only.",

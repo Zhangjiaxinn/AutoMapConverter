@@ -7,6 +7,7 @@
 - esmini 3.6.0, including `odrviewer` and `odrplot`;
 - ASAM OpenDRIVE Quality Checker 1.0.0 in an isolated virtual environment;
 - `osmium-tool` for OSM reference validation.
+- rasterio/GDAL support for semantic and occupancy GeoTIFF output.
 
 Build and use the image locally:
 
@@ -28,6 +29,10 @@ request, runs the complete current sample directory, and uploads generated maps
 and reports as the `sample-map-regression` artifact. Adding a map to one of the
 three sample directories is therefore sufficient to include it in every future
 pull-request check.
+
+Each Lanelet2 sample contributes three outgoing cases: OpenDRIVE, OSM and
+raster. Raster regression validates every generated band and companion file;
+it does not require a desktop viewer.
 
 `odrviewer` is installed in the image for local use. CI has no interactive
 desktop, so it validates OpenDRIVE by running `odrplot`; manual visual

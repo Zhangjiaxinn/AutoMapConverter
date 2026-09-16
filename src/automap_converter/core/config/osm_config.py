@@ -64,7 +64,7 @@ class OsmConfig(BaseConfig):
             "secondary_link": True,
             "tertiary_link": True,
             "living_street": True,
-            "service": False,
+            "service": True,
             "path": False,
             "footway": False,
             "cycleway": False,

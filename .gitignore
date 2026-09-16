@@ -26,8 +26,17 @@ intermediate_commonroad/
 
 # Sample maps are tracked and automatically exercised by CI.
 # Do not place private, restricted, or impractically large maps here.
-data/results/*
-!data/results/README.md
+data/maps/
+data/results/
+
+# Local research and showcase material
+/*.docx
+docs/onsite_map_conversion_showcase.md
+docs/assets/lanelet2_to_opendrive_pipeline.png
+docs/assets/map_format_ecosystem.png
+docs/assets/opendrive_conversion_result.png
+docs/assets/showcase_singapore_*.png
+docs/assets/system_pipeline.png
 
 # Secrets and editor state
 .env

@@ -554,6 +554,8 @@ def remove_unconnected_lanes(scenario: Scenario):
     graph = scenario_to_networkx_graph(scenario)
     net = scenario.lanelet_network
     lanelets = net.lanelets
+    if not lanelets:
+        return
 
     # create connections for adjacent lanelets
     tmp_edges = []
@@ -571,6 +573,8 @@ def remove_unconnected_lanes(scenario: Scenario):
     # weakly_connected.weakly_connected_component_subgraphs.html#networkx.algorithms.components.weakly_connected.
     # weakly_connected_component_subgraphs
     components = [graph.subgraph(c).copy() for c in nx.weakly_connected_components(graph)]
+    if not components:
+        return
 
     main_graph = components[0]
     for comp in components:

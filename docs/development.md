@@ -5,7 +5,7 @@
 The CI has two required jobs on every push and pull request:
 
 - `unit`: package installation, source compilation, unit tests and CLI smoke check;
-- `map-regression`: the Docker runtime executes six conversion workflows over
+- `map-regression`: the Docker runtime executes seven conversion workflows over
   the curated small maps in `data/samples/`, writes diagnostics, and uploads
   the generated maps and reports as a workflow artifact.
 

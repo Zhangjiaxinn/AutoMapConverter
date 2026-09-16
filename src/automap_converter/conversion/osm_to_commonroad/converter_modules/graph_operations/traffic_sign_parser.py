@@ -35,18 +35,17 @@ class TrafficSignParser:
                 if sign.startswith("274"):
                     zone = False
                     max_speed = -99.0
-                    if sign[4] == "[":
-                        max_speed = float(sign[sign.find("[") + 1 : sign.find("]")])
-                    elif sign[4] == "-":
-                        max_speed = float(sign[5:])
-
-                    # speed limit zone
-                    elif sign[3:].startswith(".1"):
+                    if sign[3:].startswith(".1"):
                         zone = True
-                        if sign[5] == "-" or sign[5] == ":":
-                            max_speed = float(sign[6:])
-                        else:
-                            max_speed = float(sign[sign.find("[") + 1 : sign.find("]")])
+                    value = sign[5:] if zone else sign[4:]
+                    if value.startswith(("-", ":")):
+                        value = value[1:]
+                    elif value.startswith("[") and "]" in value:
+                        value = value[1 : value.index("]")]
+                    try:
+                        max_speed = float(value)
+                    except ValueError:
+                        pass
                     if max_speed != -99:
                         if not zone:
                             # convert km/h to m/s and add to traffic sign elements

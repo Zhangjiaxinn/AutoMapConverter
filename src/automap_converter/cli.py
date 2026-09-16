@@ -1,4 +1,4 @@
-"""Command-line entry point for the four AutoMapConverter workflows."""
+"""Command-line entry point for AutoMapConverter workflows."""
 
 from __future__ import annotations
 
@@ -16,42 +16,101 @@ from automap_converter.api.converter import (
 )
 from automap_converter.api.settings import load_runtime_settings, use_runtime_settings
 from automap_converter.validation.diagnostics._workflow_runtime import run_batch
+from automap_converter.validation.diagnostics.source_map_precheck import (
+    repair_source_for_conversion,
+)
 
 
 def _add_formats(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--from", dest="source_format", required=True, choices=("lanelet2", "opendrive", "osm"))
-    parser.add_argument("--to", dest="target_format", required=True, choices=("lanelet2", "opendrive", "osm"))
+    parser.add_argument(
+        "--from",
+        dest="source_format",
+        required=True,
+        choices=("lanelet2", "opendrive", "osm"),
+    )
+    parser.add_argument(
+        "--to",
+        dest="target_format",
+        required=True,
+        choices=("lanelet2", "opendrive", "osm", "raster"),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the public command-line parser."""
 
-    parser = argparse.ArgumentParser(prog="automap-converter", description="Convert and diagnose vector road maps.")
+    parser = argparse.ArgumentParser(
+        prog="automap-converter",
+        description="Convert and diagnose vector and raster road maps.",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     convert_parser = commands.add_parser("convert", help="Convert one map.")
     _add_formats(convert_parser)
     convert_parser.add_argument("--input", required=True, type=Path)
     convert_parser.add_argument("--output", required=True, type=Path)
-    convert_parser.add_argument("--diagnose", action="store_true", help="Write Stage 1 and Stage 2 reports.")
+    convert_parser.add_argument(
+        "--diagnose", action="store_true", help="Write Stage 1 and Stage 2 reports."
+    )
     convert_parser.add_argument("--diagnostics-dir", type=Path)
-    convert_parser.add_argument("--no-sublayer", action="store_true", help="Disable OSM pedestrian/cyclist sublayers.")
+    convert_parser.add_argument(
+        "--no-sublayer",
+        action="store_true",
+        help="Disable OSM pedestrian/cyclist sublayers.",
+    )
     convert_parser.add_argument("--config", type=Path, help="Runtime YAML configuration file.")
 
-    batch_parser = commands.add_parser("batch", help="Convert every compatible map in one directory.")
+    batch_parser = commands.add_parser(
+        "batch", help="Convert every compatible map in one directory."
+    )
     _add_formats(batch_parser)
     batch_parser.add_argument("--input-dir", required=True, type=Path)
     batch_parser.add_argument("--output-dir", required=True, type=Path)
     batch_parser.add_argument("--run-name", default="")
     batch_parser.add_argument("--limit", type=int)
     batch_parser.add_argument("--config", type=Path, help="Runtime YAML configuration file.")
+
+    prepare_parser = commands.add_parser(
+        "prepare-source",
+        help="Write an explicitly requested, converter-compatible source-map copy.",
+    )
+    prepare_parser.add_argument(
+        "--from",
+        dest="source_format",
+        required=True,
+        choices=("lanelet2", "opendrive", "osm"),
+    )
+    prepare_parser.add_argument("--input", required=True, type=Path)
+    prepare_parser.add_argument("--output", required=True, type=Path)
     return parser
+
+
+def _source_repair_profile(source_format: str) -> str:
+    profiles = {
+        "lanelet2": "lanelet2_to_opendrive",
+        "opendrive": "opendrive_to_lanelet2",
+        "osm": "osm_to_lanelet2",
+    }
+    return profiles[source_format]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line application."""
 
     args = build_parser().parse_args(argv)
+    if args.command == "prepare-source":
+        source = args.input.expanduser().resolve()
+        output = args.output.expanduser().resolve()
+        prepared, records = repair_source_for_conversion(
+            _source_repair_profile(args.source_format), source, output
+        )
+        print(f"Prepared source: {prepared}")
+        for record in records:
+            print(f"[{record['status']}] {record['category']}: {record['summary']}")
+            if record.get("hint"):
+                print(f"  hint: {record['hint']}")
+        return 0
+
     conversion = conversion_name(args.source_format, args.target_format)
     if args.command == "convert":
         result = (
@@ -74,6 +133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         print(f"Converted: {result.source} -> {result.target}")
+        if result.prepared_source:
+            print(f"Prepared source used: {result.prepared_source}")
         if result.diagnostics_report:
             print(f"Diagnostics: {result.diagnostics_report}")
         return 0
@@ -93,7 +154,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Batch summary written to: {summary_path}")
         return 0
     source_suffix = ".xodr" if args.source_format == "opendrive" else ".osm"
-    target_suffix = ".xodr" if args.target_format == "opendrive" else ".osm"
+    target_suffix = (
+        ".xodr"
+        if args.target_format == "opendrive"
+        else ".tif" if args.target_format == "raster" else ".osm"
+    )
     spec = _spec_for(
         conversion,
         source_dir / f"placeholder{source_suffix}",
