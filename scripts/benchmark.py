@@ -11,7 +11,7 @@ from automap_converter import convert
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark one vector-map conversion direction.")
+    parser = argparse.ArgumentParser(description="Benchmark one map-conversion direction.")
     parser.add_argument("--from", dest="source_format", required=True)
     parser.add_argument("--to", dest="target_format", required=True)
     parser.add_argument("--input", required=True, type=Path)
@@ -22,7 +22,11 @@ def main() -> int:
     if args.repetitions < 1:
         parser.error("--repetitions must be at least one")
 
-    suffix = ".xodr" if args.target_format == "opendrive" else ".osm"
+    suffix = (
+        ".xodr"
+        if args.target_format == "opendrive"
+        else ".tif" if args.target_format == "raster" else ".osm"
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     durations = []
     for index in range(args.repetitions):

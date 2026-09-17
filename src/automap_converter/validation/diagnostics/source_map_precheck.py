@@ -17,46 +17,174 @@ INT_RE = re.compile(r"^-?\d+$")
 ODR_EPS = 1e-9
 
 
-def prepare_source_for_conversion(
+def inspect_source_for_conversion(
     conversion: str,
     source_path: Path,
-    work_dir: Path,
+) -> List[Dict[str, str]]:
+    """Validate a source map without creating a copy or changing its contents."""
+    if conversion in {
+        "osm_to_lanelet2",
+        "osm_to_opendrive",
+    }:
+        return [_load_osm_xml(source_path, "source-osm-xml")]
+    if conversion in {"lanelet2_to_osm", "lanelet2_to_opendrive"}:
+        return [
+            _load_osm_xml(source_path, "source-lanelet2-xml"),
+            _load_lanelet2_map(source_path, "source-lanelet2-loader"),
+        ]
+    if conversion in {"opendrive_to_lanelet2", "opendrive_to_osm"}:
+        return [
+            _load_opendrive_xml(source_path, "source-opendrive-xml"),
+            _load_opendrive_with_esmini(source_path, "source-opendrive-loader"),
+        ]
+    return [_record("source-validation", "SKIP", "No source validation profile is registered.")]
+
+
+def repair_source_for_conversion(
+    conversion: str,
+    source_path: Path,
+    output_path: Path,
 ) -> Tuple[Path, List[Dict[str, str]]]:
-    """Return a source path that is safer for the current converter to parse."""
-    work_dir.mkdir(parents=True, exist_ok=True)
+    """Write an explicitly requested, converter-compatible source-map copy.
+
+    This is deliberately separate from conversion. The original source is never
+    overwritten and normal conversion/diagnostic commands never call it.
+    """
+    source_path = source_path.expanduser().resolve()
+    output_path = output_path.expanduser().resolve()
+    if source_path == output_path:
+        raise ValueError("Source repair output must differ from the original source path.")
+    prepared_path, records = prepare_source_if_needed(
+        conversion,
+        source_path,
+        output_path,
+    )
+    if prepared_path == source_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, output_path)
+        records.append(
+            _record(
+                "source-repair",
+                "PASS",
+                "No repair was required; copied the validated source to the requested output path.",
+            )
+        )
+        return output_path, records
+    return prepared_path, records
+
+
+def prepare_source_if_needed(
+    conversion: str,
+    source_path: Path,
+    output_path: Path,
+) -> Tuple[Path, List[Dict[str, str]]]:
+    """Apply known source compatibility repairs only when they change a copy.
+
+    The source path is never modified. If no repair rule changes the source,
+    this returns the original path and does not create ``output_path``.
+    """
+    source_path = source_path.expanduser().resolve()
+    output_path = output_path.expanduser().resolve()
+    if source_path == output_path:
+        raise ValueError("Prepared source output must differ from the original source path.")
+
+    prepared_path, records = _prepare_source_for_repair(
+        conversion,
+        source_path,
+        output_path,
+    )
+    if prepared_path == source_path:
+        return source_path, []
+
+    records.insert(
+        0,
+        _record(
+            "source-repair",
+            "WARN",
+            "Applied known source compatibility repairs to a run-local copy.",
+            f"Original source remains unchanged: {source_path}",
+        ),
+    )
+    return prepared_path, records
+
+
+def detect_repairable_source_issues(
+    conversion: str,
+    source_path: Path,
+) -> List[Dict[str, str]]:
+    """Detect known repairable source issues without writing a source copy."""
+    try:
+        if conversion in {
+            "osm_to_lanelet2",
+            "osm_to_opendrive",
+            "lanelet2_to_osm",
+            "lanelet2_to_opendrive",
+        }:
+            root = etree.parse(str(source_path)).getroot()
+            changed, records = _apply_osm_repair_rules(conversion, root)
+        elif conversion in {"opendrive_to_lanelet2", "opendrive_to_osm"}:
+            parser = etree.XMLParser(remove_blank_text=False)
+            root = etree.parse(str(source_path), parser).getroot()
+            changed, records = _apply_opendrive_repair_rules(root)
+        else:
+            return []
+    except (OSError, ValueError, etree.XMLSyntaxError):
+        return []
+
+    if not changed:
+        return []
+    return [
+        _record(
+            "source-repair-candidate",
+            "WARN",
+            f"Detected repairable source issue: {record['summary']}",
+            record.get("hint", ""),
+        )
+        for record in records
+    ]
+
+
+def _prepare_source_for_repair(
+    conversion: str,
+    source_path: Path,
+    output_path: Path,
+) -> Tuple[Path, List[Dict[str, str]]]:
+    """Apply source-only repair rules to an explicitly requested output path."""
     if conversion in {
         "osm_to_lanelet2",
         "osm_to_opendrive",
         "lanelet2_to_osm",
         "lanelet2_to_opendrive",
     }:
-        return _prepare_osm_source(conversion, source_path, work_dir)
+        return _prepare_osm_source(conversion, source_path, output_path)
     if conversion in {"opendrive_to_lanelet2", "opendrive_to_osm"}:
-        return _prepare_opendrive_source(source_path, work_dir)
-    return source_path, [_record("source-precheck", "SKIP", "No source precheck profile is registered.")]
-
-
-def repair_target_after_conversion(
-    conversion: str,
-    target_path: Path,
-    work_dir: Path,
-) -> List[Dict[str, str]]:
-    """Apply conservative target-side repairs required by strict target loaders."""
-    work_dir.mkdir(parents=True, exist_ok=True)
-    if conversion in {"opendrive_to_lanelet2", "osm_to_lanelet2"}:
-        return _repair_lanelet2_target(target_path)
-    if conversion in {"lanelet2_to_osm", "opendrive_to_osm"}:
-        return _repair_osm_versions(target_path, label="target-osm")
-    return [_record("target-repair", "SKIP", "No target repair profile is registered.")]
+        return _prepare_opendrive_source(source_path, output_path)
+    return source_path, [_record("source-repair", "SKIP", "No source repair profile is registered.")]
 
 
 def _prepare_osm_source(
     conversion: str,
     source_path: Path,
-    work_dir: Path,
+    output_path: Path,
 ) -> Tuple[Path, List[Dict[str, str]]]:
     tree = etree.parse(str(source_path))
     root = tree.getroot()
+    changed, records = _apply_osm_repair_rules(conversion, root)
+
+    if not changed:
+        records.append(_record("source-precheck", "PASS", "Source OSM passed lightweight precheck."))
+        _append_source_load_checks(conversion, source_path, records)
+        return source_path, records
+
+    _write_xml(tree, output_path)
+    _append_source_load_checks(conversion, output_path, records)
+    return output_path, records
+
+
+def _apply_osm_repair_rules(
+    conversion: str,
+    root: etree._Element,
+) -> Tuple[bool, List[Dict[str, str]]]:
     records: List[Dict[str, str]] = []
     changed = False
 
@@ -95,22 +223,28 @@ def _prepare_osm_source(
                     "Plain OSM highway=stop/give_way is preserved and also exposed as DE:206/DE:205 for the current parser.",
                 )
             )
-
-    if not changed:
-        records.append(_record("source-precheck", "PASS", "Source OSM passed lightweight precheck."))
-        _append_source_load_checks(conversion, source_path, records)
-        return source_path, records
-
-    prepared_path = work_dir / source_path.name
-    _write_xml(tree, prepared_path)
-    _append_source_load_checks(conversion, prepared_path, records)
-    return prepared_path, records
+    return changed, records
 
 
-def _prepare_opendrive_source(source_path: Path, work_dir: Path) -> Tuple[Path, List[Dict[str, str]]]:
+def _prepare_opendrive_source(source_path: Path, output_path: Path) -> Tuple[Path, List[Dict[str, str]]]:
     parser = etree.XMLParser(remove_blank_text=False)
     tree = etree.parse(str(source_path), parser)
     root = tree.getroot()
+    changed, records = _apply_opendrive_repair_rules(root)
+
+    if not changed:
+        records.append(_record("source-precheck", "PASS", "Source OpenDRIVE passed lightweight precheck."))
+        _append_source_load_checks("opendrive_to_lanelet2", source_path, records)
+        return source_path, records
+
+    _write_xml(tree, output_path)
+    _append_source_load_checks("opendrive_to_lanelet2", output_path, records)
+    return output_path, records
+
+
+def _apply_opendrive_repair_rules(
+    root: etree._Element,
+) -> Tuple[bool, List[Dict[str, str]]]:
     records: List[Dict[str, str]] = []
     changed = False
 
@@ -186,15 +320,7 @@ def _prepare_opendrive_source(source_path: Path, work_dir: Path) -> Tuple[Path, 
             )
         )
 
-    if not changed:
-        records.append(_record("source-precheck", "PASS", "Source OpenDRIVE passed lightweight precheck."))
-        _append_source_load_checks("opendrive_to_lanelet2", source_path, records)
-        return source_path, records
-
-    prepared_path = work_dir / source_path.name
-    _write_xml(tree, prepared_path)
-    _append_source_load_checks("opendrive_to_lanelet2", prepared_path, records)
-    return prepared_path, records
+    return changed, records
 
 
 def _append_source_load_checks(conversion: str, source_path: Path, records: List[Dict[str, str]]) -> None:
@@ -244,6 +370,21 @@ def _load_osm_xml(path: Path, category: str) -> Dict[str, str]:
             category,
             "FAIL",
             "Source OSM XML could not be parsed after precheck.",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _load_opendrive_xml(path: Path, category: str) -> Dict[str, str]:
+    try:
+        root = etree.parse(str(path)).getroot()
+        if etree.QName(root).localname != "OpenDRIVE":
+            raise ValueError(f"Root tag is {root.tag!r}, expected 'OpenDRIVE'.")
+        return _record(category, "PASS", "Source OpenDRIVE XML is well formed and has an OpenDRIVE root.")
+    except Exception as exc:
+        return _record(
+            category,
+            "FAIL",
+            "Source OpenDRIVE XML could not be parsed.",
             f"{type(exc).__name__}: {exc}",
         )
 
@@ -305,77 +446,6 @@ def _find_project_tool(name: str) -> str:
     return ""
 
 
-def _repair_lanelet2_target(target_path: Path) -> List[Dict[str, str]]:
-    if not target_path.exists():
-        return [_record("target-lanelet2-repair", "SKIP", "Target does not exist yet.")]
-
-    tree = etree.parse(str(target_path))
-    root = tree.getroot()
-    records: List[Dict[str, str]] = []
-    changed = False
-
-    version_changes = _ensure_osm_versions(root)
-    if version_changes:
-        changed = True
-        records.append(
-            _record(
-                "target-lanelet2-version",
-                "WARN",
-                f"Added missing OSM/Lanelet2 version attributes ({version_changes} primitives/root items).",
-            )
-        )
-
-    ref_changes = _drop_dangling_members(root)
-    if ref_changes:
-        changed = True
-        records.append(
-            _record(
-                "target-lanelet2-dangling-refs",
-                "WARN",
-                f"Removed {ref_changes} relation members that referenced missing primitives.",
-                "Lanelet2 loader rejects relations with unresolved members.",
-            )
-        )
-
-    invalid_relations = _drop_invalid_lanelet2_relations(root)
-    if invalid_relations:
-        changed = True
-        records.append(
-            _record(
-                "target-lanelet2-invalid-relations",
-                "WARN",
-                f"Removed {invalid_relations} invalid Lanelet2 relations and their references.",
-                "This is a loader-safety fallback; semantic losses are still visible in Stage2.",
-            )
-        )
-
-    if changed:
-        _write_xml(tree, target_path)
-    else:
-        records.append(_record("target-repair", "PASS", "Target did not require loader-safety repair."))
-    return records
-
-
-def _repair_osm_versions(target_path: Path, label: str) -> List[Dict[str, str]]:
-    if not target_path.exists():
-        return [_record(label, "SKIP", "Target does not exist yet.")]
-    tree = etree.parse(str(target_path))
-    root = tree.getroot()
-    version_changes = _ensure_osm_versions(root)
-    order_changed = _normalize_osm_primitive_order(root)
-    if version_changes or order_changed:
-        _write_xml(tree, target_path)
-        notes = []
-        if version_changes:
-            notes.append(
-                f"added missing OSM version attributes ({version_changes} primitives/root items)"
-            )
-        if order_changed:
-            notes.append("ordered nodes, ways and relations by numeric id for osmium")
-        return [_record(label, "WARN", "Target OSM normalized: " + "; ".join(notes) + ".")]
-    return [_record(label, "PASS", "OSM version attributes are present and primitives are ordered.")]
-
-
 def _ensure_osm_versions(root: etree._Element) -> int:
     changes = 0
     if root.tag == "osm" and not root.get("version"):
@@ -386,47 +456,6 @@ def _ensure_osm_versions(root: etree._Element) -> int:
             elem.set("version", "1")
             changes += 1
     return changes
-
-
-def _normalize_osm_primitive_order(root: etree._Element) -> bool:
-    """Put OSM primitives in the canonical osmium order without changing references."""
-    if root.tag != "osm":
-        return False
-    children = list(root)
-    grouped = {
-        name: [child for child in children if child.tag == name]
-        for name in ("node", "way", "relation")
-    }
-    ordered_primitives = []
-    for name in ("node", "way", "relation"):
-        ordered_primitives.extend(
-            sorted(grouped[name], key=lambda child: _osm_id_sort_key(child.get("id", "")))
-        )
-    other_children = [
-        child for child in children if child.tag not in {"node", "way", "relation"}
-    ]
-    normalized = other_children + ordered_primitives
-    if normalized == children:
-        return False
-    root[:] = normalized
-    return True
-
-
-def _osm_id_sort_key(value: str) -> Tuple[int, int, str]:
-    """Match osmium's ordering when generated OSM uses temporary negative IDs.
-
-    ``osmium check-refs`` compares IDs through its internal unsigned ordering.
-    Therefore temporary negative IDs come first in descending signed order
-    (``-1, -2, ...``), followed by positive IDs in ascending order, rather
-    than ordinary numeric ascending order.
-    """
-    try:
-        numeric_id = int(value)
-    except ValueError:
-        return 2, 0, value
-    if numeric_id >= 0:
-        return 1, numeric_id, value
-    return 0, -numeric_id, value
 
 
 def _drop_unparseable_osm_traffic_signs(root: etree._Element) -> int:
@@ -585,45 +614,6 @@ def _downgrade_constant_spirals(root: etree._Element) -> int:
     return changes
 
 
-def _drop_dangling_members(root: etree._Element) -> int:
-    node_ids = {elem.get("id") for elem in root.findall("node")}
-    way_ids = {elem.get("id") for elem in root.findall("way")}
-    relation_ids = {elem.get("id") for elem in root.findall("relation")}
-    removed = 0
-
-    removed_way_ids: set[str] = set()
-    for way in list(root.findall("way")):
-        for nd in list(way.findall("nd")):
-            if nd.get("ref") not in node_ids:
-                way.remove(nd)
-                removed += 1
-        if len(way.findall("nd")) == 0:
-            way_id = way.get("id")
-            if way_id:
-                removed_way_ids.add(way_id)
-            parent = way.getparent()
-            if parent is not None:
-                parent.remove(way)
-                removed += 1
-
-    if removed_way_ids:
-        way_ids = {elem.get("id") for elem in root.findall("way")}
-
-    ids_by_type = {
-        "node": node_ids,
-        "way": way_ids,
-        "relation": relation_ids,
-    }
-    for relation in root.findall("relation"):
-        for member in list(relation.findall("member")):
-            member_type = member.get("type")
-            member_ref = member.get("ref")
-            if member_type in ids_by_type and member_ref not in ids_by_type[member_type]:
-                relation.remove(member)
-                removed += 1
-    return removed
-
-
 def _localize_crosswalk_corner_road_outlines(root: etree._Element) -> int:
     changes = 0
     for obj in root.xpath(".//object[@type='crosswalk']"):
@@ -664,39 +654,6 @@ def _drop_invalid_crosswalk_objects(root: etree._Element) -> int:
             parent.remove(obj)
             removed += 1
     return removed
-
-
-def _drop_invalid_lanelet2_relations(root: etree._Element) -> int:
-    removed_ids: set[str] = set()
-    changed = True
-    while changed:
-        changed = False
-        for relation in list(root.findall("relation")):
-            relation_id = relation.get("id")
-            tags = {tag.get("k"): tag.get("v") for tag in relation.findall("tag")}
-            members = relation.findall("member")
-            remove = False
-            if tags.get("type") == "lanelet":
-                roles = {member.get("role") for member in members}
-                remove = "left" not in roles or "right" not in roles
-            elif tags.get("type") == "regulatory_element" and tags.get("subtype") == "right_of_way":
-                remove = not any(member.get("role") == "right_of_way" for member in members)
-            if not remove:
-                continue
-            parent = relation.getparent()
-            if parent is not None:
-                parent.remove(relation)
-                if relation_id:
-                    removed_ids.add(relation_id)
-                changed = True
-
-        if removed_ids:
-            for relation in root.findall("relation"):
-                for member in list(relation.findall("member")):
-                    if member.get("type") == "relation" and member.get("ref") in removed_ids:
-                        relation.remove(member)
-
-    return len(removed_ids)
 
 
 def _add_userdata(parent: etree._Element, code: str, value: str) -> None:

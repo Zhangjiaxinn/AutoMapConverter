@@ -3,25 +3,36 @@
 from pathlib import Path
 
 from automap_converter import convert_and_diagnose
-
+from automap_converter.api.result_layout import (
+    allocate_result_run,
+    write_result_manifest,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE = PROJECT_ROOT / "data" / "samples" / "opendrive" / "commonroad_straight_road.xodr"
-OUTPUT_DIR = PROJECT_ROOT / "data" / "results" / "opendrive_to_osm"
-TARGET = OUTPUT_DIR / "commonroad_straight_road.osm"
+RESULTS_ROOT = PROJECT_ROOT / "data" / "results"
 
 
 def main() -> None:
-    result = convert_and_diagnose(SOURCE, TARGET, "opendrive", "osm", diagnostics_dir=OUTPUT_DIR)
+    run = allocate_result_run(RESULTS_ROOT, "opendrive_to_osm", SOURCE, ".osm")
+    result = convert_and_diagnose(
+        SOURCE,
+        run.target,
+        "opendrive",
+        "osm",
+        diagnostics_dir=run.directory,
+    )
+    manifest = write_result_manifest(run, result.diagnostics_report)
     print(f"Converted map: {result.target}")
     print(f"Diagnostics: {result.diagnostics_report}")
+    print(f"Manifest: {manifest}")
 
     # Batch conversion example:
     # from automap_converter.cli import main as cli_main
     # cli_main([
     #     "batch", "--from", "opendrive", "--to", "osm",
     #     "--input-dir", "path/to/opendrive_maps",
-    #     "--output-dir", "data/results/opendrive_to_osm_batch",
+    #     "--output-dir", "data/results",
     # ])
 
 

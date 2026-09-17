@@ -62,10 +62,23 @@ def get_crosswalks(
         )
 
         for outline in crosswalk.outline:
-            p = np.atleast_2d([position[0] + outline.u, position[1] + outline.v])
-            # rotate every point
-            rot_p = np.squeeze((rotation_matrix @ (p.T - o.T) + o.T).T)
+            if outline.coordinate_type == "road":
+                road_pos, road_tangent, _, _ = road.plan_view.calc(
+                    outline.s, compute_curvature=False
+                )
+                rot_p = road_pos + outline.t * np.array(
+                    [-np.sin(road_tangent), np.cos(road_tangent)]
+                )
+            else:
+                p = np.atleast_2d([position[0] + outline.u, position[1] + outline.v])
+                rot_p = np.squeeze((rotation_matrix @ (p.T - o.T) + o.T).T)
             corners = np.vstack((corners, rot_p))
+
+        if len(corners) < 4:
+            logging.warning(
+                "Skipping crosswalk object %s: fewer than four outline corners", crosswalk.id
+            )
+            continue
 
         # object has four elements -> assume they are corners -> left and right
         # boundary each represented by two vertices

@@ -10,3 +10,6 @@
 - Do not use provenance tags to recreate information that was never converted.
   Diagnostics may use provenance for tracing, but round-trip quality is based
   on geometry, topology and semantic comparison.
+- Raster products keep non-spatial graph relationships and source identities
+  in a versioned metadata sidecar; pixel values alone are not treated as a
+  lossless vector representation.

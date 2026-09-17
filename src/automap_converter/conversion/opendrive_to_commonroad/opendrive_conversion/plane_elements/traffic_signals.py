@@ -9,7 +9,6 @@ from commonroad.scenario.traffic_sign import (
     TrafficSign,
     TrafficSignElement,
     TrafficSignIDChina,
-    TrafficSignIDCountries,
     TrafficSignIDGermany,
     TrafficSignIDRussia,
     TrafficSignIDSpain,
@@ -144,7 +143,11 @@ def assign_traffic_signals_to_road(
             signal_country = utils.get_signal_country(signal.country)
             if str(signal.type) in {"1000003", "1000004"}:
                 continue
-            traffic_sign_enum = TrafficSignIDCountries[signal_country]
+            # OpenDRIVE permits extension-specific country identifiers.  The
+            # CommonRoad lookup table is intentionally narrower, so use the
+            # project's country resolver to retain an unknown signal as a
+            # generic traffic sign instead of aborting the whole conversion.
+            traffic_sign_enum = utils.get_traffic_sign_enum_from_country(signal_country)
 
             if _is_opendrive_stop_line_signal(signal):
                 # Creating stop line object by first calculating the position of the two end points that define the

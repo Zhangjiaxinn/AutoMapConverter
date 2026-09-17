@@ -108,6 +108,7 @@ class TargetStats:
     mapped_way_ids: set = field(default_factory=set)
     mapped_area_ids: set = field(default_factory=set)
     mapped_regulatory_ids: set = field(default_factory=set)
+    unresolved_regulatory_signal_ids: set = field(default_factory=set)
 
 
 class Lanelet2OpenDriveDiagnostics:
@@ -119,15 +120,17 @@ class Lanelet2OpenDriveDiagnostics:
         target_xodr_path: str | Path,
         external_validator_cmd: Optional[str] = None,
         external_timeout_sec: int = 20,
+        original_source_path: str | Path | None = None,
+        source_preparation: Optional[Sequence[Dict[str, str]]] = None,
     ) -> None:
         self.source_path = Path(source_lanelet2_path)
+        self.original_source_path = Path(original_source_path or source_lanelet2_path)
+        self.source_preparation = list(source_preparation or [])
         self.target_path = Path(target_xodr_path)
-        self.report_path = _conversion_artifact_path(
-            self.target_path, "diagnostics", "_diagnostics.txt"
-        )
         self.json_report_path = _conversion_artifact_path(
             self.target_path, "diagnostics", "_diagnostics.json"
         )
+        self.report_path = self.json_report_path
         self.external_validator_cmd = external_validator_cmd or os.environ.get(
             "OPENDRIVE_VALIDATOR_CMD"
         )
@@ -1129,6 +1132,23 @@ class Lanelet2OpenDriveDiagnostics:
                 "userData. Its physical ways are checked separately in the source-way audit."
             ),
         )
+        unresolved = sorted(
+            src.convertible_regulatory_ids & dst.unresolved_regulatory_signal_ids
+        )
+        if unresolved:
+            self._add(
+                "semantic",
+                "5b-regulatory-signal-type",
+                "WARN",
+                f"{len(unresolved)} source regulatory relations have only an unknown OpenDRIVE signal type.",
+                source=f"regulatory_relations={len(src.convertible_regulatory_ids)}",
+                target=f"unknown_signal_type_relations={len(unresolved)}",
+                method=(
+                    "Source ID metadata preserves traceability, but OpenDRIVE type=-1 "
+                    "does not encode the original traffic or area semantics."
+                ),
+                location=", ".join(unresolved[:30]),
+            )
 
     def _add_source_coverage_result(
         self,
@@ -1489,6 +1509,15 @@ class Lanelet2OpenDriveDiagnostics:
                 if signal.get("type") == "1100001":
                     stats.stop_lines += 1
                 self._collect_target_source_metadata(signal, stats)
+                if signal.get("type") in {None, "", "-1"}:
+                    user_data = {
+                        item.get("code", ""): item.get("value", "")
+                        for item in signal.findall("userData")
+                    }
+                    if user_data.get("lanelet2:source_kind") == "regulatory_element":
+                        source_id = user_data.get("lanelet2:source_id", "")
+                        if source_id:
+                            stats.unresolved_regulatory_signal_ids.add(source_id)
 
             for obj in road.findall("./objects/object"):
                 stats.objects += 1
@@ -1527,6 +1556,13 @@ class Lanelet2OpenDriveDiagnostics:
         source_ids = values.get("lanelet2:source_id", [])
         if "way" in kinds:
             stats.mapped_way_ids.update(value for value in source_ids if value)
+        stats.mapped_way_ids.update(
+            value for value in values.get("lanelet2:source_way_id", []) if value
+        )
+        if "regulatory_element" in kinds:
+            stats.mapped_regulatory_ids.update(
+                value for value in source_ids if value
+            )
         stats.mapped_regulatory_ids.update(
             value
             for value in values.get("lanelet2:regulatory_element", [])
@@ -1715,7 +1751,7 @@ class Lanelet2OpenDriveDiagnostics:
             "Lanelet2 -> OpenDRIVE Conversion Quality Report",
             "=" * 64,
             f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Source: {self.source_path}",
+            f"Source: {self.original_source_path}",
             f"Target: {self.target_path}",
             f"Elapsed: {elapsed:.2f}s",
             "",
@@ -1732,6 +1768,22 @@ class Lanelet2OpenDriveDiagnostics:
                 else "Result: PASS"
             ),
         ]
+        if self.source_path != self.original_source_path:
+            lines.extend(
+                [
+                    "",
+                    "Source preparation:",
+                    f"Prepared source used for conversion: {self.source_path}",
+                ]
+            )
+            for record in self.source_preparation:
+                lines.append(
+                    f"[{record.get('status', 'UNKNOWN')}] "
+                    f"{record.get('category', 'source-repair')}: "
+                    f"{record.get('summary', '')}"
+                )
+                if record.get("hint"):
+                    lines.append(f"  hint: {record['hint']}")
 
         report_groups = (
             (
@@ -1767,7 +1819,7 @@ class Lanelet2OpenDriveDiagnostics:
         for group_name, title, predicate in report_groups:
             group_results = [item for item in self.results if predicate(item)]
             structured_groups[group_name] = [
-                asdict(result) for result in group_results
+                asdict(result) for result in group_results if result.status != "PASS"
             ]
             lines.extend(["", title, "-" * 64])
             for result in group_results:
@@ -1841,12 +1893,21 @@ class Lanelet2OpenDriveDiagnostics:
                         )
                 lines.append("")
 
-        self.report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
         payload = {
             "schema_version": "1.0",
             "conversion": "lanelet2_to_opendrive",
             "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "source": str(self.source_path),
+            "source": str(self.original_source_path),
+            "prepared_source": (
+                str(self.source_path)
+                if self.source_path != self.original_source_path
+                else ""
+            ),
+            "source_preparation": [
+                record
+                for record in self.source_preparation
+                if record.get("status") != "PASS"
+            ],
             "target": str(self.target_path),
             "elapsed_seconds": round(elapsed, 3),
             "summary": {
@@ -2094,6 +2155,8 @@ def diagnose_lanelet2_to_opendrive(
     target_xodr_path: str | Path,
     external_validator_cmd: Optional[str] = None,
     external_timeout_sec: int = 20,
+    original_source_path: str | Path | None = None,
+    source_preparation: Optional[Sequence[Dict[str, str]]] = None,
 ) -> Path:
     """Diagnose one Lanelet2 -> OpenDRIVE conversion and return the report path."""
     return Lanelet2OpenDriveDiagnostics(
@@ -2101,6 +2164,8 @@ def diagnose_lanelet2_to_opendrive(
         target_xodr_path=target_xodr_path,
         external_validator_cmd=external_validator_cmd,
         external_timeout_sec=external_timeout_sec,
+        original_source_path=original_source_path,
+        source_preparation=source_preparation,
     ).run()
 
 

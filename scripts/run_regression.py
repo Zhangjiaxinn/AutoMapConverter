@@ -27,11 +27,15 @@ class RegressionCase:
 
     @property
     def target_suffix(self) -> str:
-        return ".xodr" if self.target_format == "opendrive" else ".osm"
+        if self.target_format == "opendrive":
+            return ".xodr"
+        if self.target_format == "raster":
+            return ".tif"
+        return ".osm"
 
 
 SAMPLE_WORKFLOWS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "lanelet2": (".osm", ("opendrive", "osm")),
+    "lanelet2": (".osm", ("opendrive", "osm", "raster")),
     "opendrive": (".xodr", ("lanelet2", "osm")),
     "osm": (".osm", ("lanelet2", "opendrive")),
 }

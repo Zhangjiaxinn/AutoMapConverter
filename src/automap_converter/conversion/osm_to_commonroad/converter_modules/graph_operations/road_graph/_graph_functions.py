@@ -145,10 +145,15 @@ def set_points(predecessor: Lane, successor: Lane) -> List[np.ndarray]:
     p1 = predecessor.waypoints[-1]
     p4 = successor.waypoints[0]
     vector1 = p1 - predecessor.waypoints[-2]
-    vector1 = vector1 / np.linalg.norm(vector1) * np.linalg.norm(p1 - p4) * d
-    p2 = p1 + vector1
     vector2 = p4 - successor.waypoints[1]
-    vector2 = vector2 / np.linalg.norm(vector2) * np.linalg.norm(p1 - p4) * d
+    distance = np.linalg.norm(p1 - p4)
+    if not np.isfinite(distance):
+        raise ValueError("Cannot link lanes with non-finite endpoint coordinates")
+    if distance < 1e-9 or np.linalg.norm(vector1) < 1e-9 or np.linalg.norm(vector2) < 1e-9:
+        return list(np.linspace(p1, p4, max(int(distance / point_distance), 2) + 1))
+    vector1 = vector1 / np.linalg.norm(vector1) * distance * d
+    p2 = p1 + vector1
+    vector2 = vector2 / np.linalg.norm(vector2) * distance * d
     p3 = p4 + vector2
     n = max(int(np.linalg.norm(p1 - p4) / point_distance), 2)
     a1, a2, intersection_point = geometry.intersection(p1, p4, vector1, vector2)

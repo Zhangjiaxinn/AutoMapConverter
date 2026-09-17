@@ -21,6 +21,14 @@ Generate generic OSM centerline roads and selected road-level rules. This route
 is intentionally lossy because OSM does not natively encode every Lanelet2
 lane-level relation, area or topology detail.
 
+## Lanelet2 -> Raster
+
+Parse Lanelet2 relations and reconstruct lane polygons, boundaries and
+centerlines in a metric coordinate frame. Supersampled rasterization produces
+a six-band semantic GeoTIFF, binary occupancy GeoTIFF and preview images. A
+metadata sidecar retains vector-to-raster identity and graph relationships.
+This is a one-way delivery format; no raster-to-vector route is claimed.
+
 There is no duplicate direct OSM <-> OpenDRIVE module. Compose the two
 directions through Lanelet2 when that transformation is required.
 

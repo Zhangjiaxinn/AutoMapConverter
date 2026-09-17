@@ -3,6 +3,12 @@ conversion:
   lanelet2_routing_enrichment: true
   osm_extract_sublayer: true
   opendrive_version: "1.6.1"
+raster:
+  resolution_m: 0.5
+  padding_m: 5.0
+  supersampling: 4
+  topology_tolerance_m: 1.0
+  max_output_pixels: 40000000
 stage1:
   launch_viewer: false
 diagnostics:
