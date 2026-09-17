@@ -1,5 +1,12 @@
 # AutoMapConverter
 
+[![CI](https://github.com/Zhangjiaxinn/AutoMapConverter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Zhangjiaxinn/AutoMapConverter/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.0-2f6fbb)](#development-status)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11-3776ab?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux-fcc624?logo=linux&logoColor=black)](docs/runtime.md)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-d95f2d)](LICENSE.txt)
+[![Workflows](https://img.shields.io/badge/conversion%20workflows-7-2e8b57)](#supported-workflows)
+
 AutoMapConverter is a multi-format road-map conversion and quality-analysis
 toolkit for autonomous-driving research, simulation and data engineering. It
 provides inspectable workflows across Lanelet2, OpenDRIVE and OpenStreetMap
@@ -10,8 +17,6 @@ The system coordinates geometry reconstruction, topology mapping, semantic
 preservation and acceptance analysis across every conversion workflow. Each
 public route has a stable Python/CLI entry point, structured diagnostics and
 reproducible regression execution.
-
-![AutoMapConverter system architecture](docs/assets/system_architecture.png)
 
 ## Development Status
 
@@ -39,19 +44,15 @@ diagnostics.
 
 ## Supported Workflows
 
-| Source | Target | Internal workflow |
+| Workflow | Implementation | Functionality |
 | --- | --- | --- |
-| Lanelet2 | OpenDRIVE | direct |
-| OpenDRIVE | Lanelet2 | OpenDRIVE -> intermediate lane-network model -> Lanelet2 |
-| OSM | Lanelet2 | OSM -> intermediate road-graph model -> Lanelet2 |
-| Lanelet2 | OSM | direct, intentionally lossy |
-| OSM | OpenDRIVE | OSM -> Lanelet2 -> OpenDRIVE |
-| OpenDRIVE | OSM | OpenDRIVE -> Lanelet2 -> OSM |
-| Lanelet2 | Raster | direct relation-aware semantic and occupancy rasterization |
-
-The two composed routes reuse the explicit Lanelet2 workflows as their shared
-conversion foundation. Raster is intentionally a one-way product format: the
-vector source remains the authoritative map.
+| Lanelet2 -> OpenDRIVE | [`conversion/lanelet2_to_opendrive`](src/automap_converter/conversion/lanelet2_to_opendrive) | Direct conversion from Lanelet2 to OpenDRIVE. |
+| OpenDRIVE -> Lanelet2 | [`conversion/opendrive_to_commonroad`](src/automap_converter/conversion/opendrive_to_commonroad)<br>[`conversion/commonroad_to_lanelet2`](src/automap_converter/conversion/commonroad_to_lanelet2) | Conversion from OpenDRIVE to CommonRoad, then from CommonRoad to Lanelet2. |
+| OSM -> Lanelet2 | [`conversion/osm_to_commonroad`](src/automap_converter/conversion/osm_to_commonroad)<br>[`conversion/commonroad_to_lanelet2`](src/automap_converter/conversion/commonroad_to_lanelet2) | Conversion from OSM to CommonRoad, then from CommonRoad to Lanelet2. |
+| Lanelet2 -> OSM | [`conversion/lanelet2_to_osm`](src/automap_converter/conversion/lanelet2_to_osm) | Conversion from Lanelet2 to generic OSM roads with documented lane-level information loss. |
+| OSM -> OpenDRIVE | Composed workflow | OSM -> CommonRoad -> Lanelet2 -> OpenDRIVE. |
+| OpenDRIVE -> OSM | Composed workflow | OpenDRIVE -> CommonRoad -> Lanelet2 -> OSM. |
+| Lanelet2 -> Raster | [`conversion/lanelet2_to_raster`](src/automap_converter/conversion/lanelet2_to_raster) | One-way semantic and occupancy rasterization with vector-to-raster metadata. |
 
 ## Installation
 
