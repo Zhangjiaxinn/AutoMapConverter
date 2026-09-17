@@ -24,10 +24,25 @@ intermediate_commonroad/
 *_source_odrplot.csv
 *.patch
 
-# Sample maps are tracked and automatically exercised by CI.
-# Do not place private, restricted, or impractically large maps here.
-data/results/*
-!data/results/README.md
+# Keep the public sample suite intentionally small. Additional development and
+# evaluation maps stay local under data/maps/ or these ignored sample folders.
+data/samples/lanelet2/*
+!data/samples/lanelet2/basic_intersection_area.osm
+data/samples/opendrive/*
+!data/samples/opendrive/commonroad_straight_road.xodr
+data/samples/osm/*
+!data/samples/osm/ped_crossing.osm
+data/maps/
+data/results/
+
+# Local research and showcase material
+/*.docx
+docs/onsite_map_conversion_showcase.md
+docs/assets/lanelet2_to_opendrive_pipeline.png
+docs/assets/map_format_ecosystem.png
+docs/assets/opendrive_conversion_result.png
+docs/assets/showcase_singapore_*.png
+docs/assets/system_pipeline.png
 
 # Secrets and editor state
 .env

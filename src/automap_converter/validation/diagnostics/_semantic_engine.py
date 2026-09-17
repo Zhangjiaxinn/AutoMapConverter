@@ -6,7 +6,7 @@ import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from lxml import etree
 
@@ -128,6 +128,7 @@ class OpenDriveStats:
     signal_details: List[Dict[str, object]] = field(default_factory=list)
     object_details: List[Dict[str, object]] = field(default_factory=list)
     signal_categories: Counter = field(default_factory=Counter)
+    invalid_center_driving_lane_details: List[Dict[str, object]] = field(default_factory=list)
 
 
 def diagnose_stage2(
@@ -136,7 +137,17 @@ def diagnose_stage2(
     target_path: str | Path,
     diagnostics_dir: str | Path,
     stage1_payload: Optional[Dict[str, object]] = None,
-) -> Tuple[Path, Path, Dict[str, object]]:
+) -> Tuple[Path, Dict[str, object]]:
+    if conversion == "lanelet2_to_raster":
+        from .lanelet2_raster_diagnostics import diagnose_lanelet2_to_raster
+
+        return diagnose_lanelet2_to_raster(
+            source_path,
+            target_path,
+            diagnostics_dir,
+            stage1_payload=stage1_payload,
+        )
+
     source_path = Path(source_path)
     target_path = Path(target_path)
     diagnostics_dir = Path(diagnostics_dir)
@@ -175,46 +186,52 @@ def diagnose_stage2(
 
     checks = _filter_enabled_diagnostics(checks)
     counts = _count_statuses(checks)
-    result = _result_from_counts(counts)
+    acceptance_counts = (stage1_payload or {}).get("summary", {})
+    result = _result_from_counts(_merge_status_counts(counts, acceptance_counts))
     payload = {
         "schema_version": "1.0",
         "stage": "stage1_and_stage2",
         "conversion": conversion,
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": str(source_path),
+        "prepared_source": (stage1_payload or {}).get("prepared_source", ""),
+        "source_precheck": (stage1_payload or {}).get("source_precheck", []),
+        "conversion_notes": (stage1_payload or {}).get("conversion_notes", []),
         "target": str(target_path),
         "elapsed_seconds": round(time.time() - started, 3),
         "result": result,
         "summary": counts,
-        "acceptance": (stage1_payload or {}).get("acceptance", []),
+        "acceptance": [
+            item
+            for item in (stage1_payload or {}).get("acceptance", [])
+            if item.get("status") != "PASS"
+        ],
         "acceptance_summary": (stage1_payload or {}).get("summary", {}),
         "diagnostics": {
             "target_conformance": [
                 asdict(check)
                 for check in checks
-                if check.stage == "diagnosis"
+                if check.stage == "diagnosis" and check.status != "PASS"
             ],
             "topology": [
                 asdict(check)
                 for check in checks
-                if check.stage == "topology"
+                if check.stage == "topology" and check.status != "PASS"
             ],
             "element_mapping": [
                 asdict(check)
                 for check in checks
-                if check.stage == "semantic"
+                if check.stage == "semantic" and check.status != "PASS"
             ],
         },
     }
 
-    txt_path = diagnostics_dir / f"{target_path.stem}_diagnostics.txt"
     json_path = diagnostics_dir / f"{target_path.stem}_diagnostics.json"
     json_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    _write_text_report(txt_path, payload)
-    return txt_path, json_path, payload
+    return json_path, payload
 
 
 def _filter_enabled_diagnostics(checks: Sequence[DiagnosticCheck]) -> List[DiagnosticCheck]:
@@ -252,6 +269,7 @@ def _diagnose_opendrive_to_lanelet2(
     target = _collect_osm_stats(target_root)
 
     checks.append(_opendrive_structure_check(source))
+    checks.append(_opendrive_center_lane_conformance_check(source))
     checks.append(_lanelet2_structure_check(target))
     checks.append(_opendrive_lane_inventory_check(source, target))
     checks.append(
@@ -583,6 +601,13 @@ def _collect_osm_stats(root: etree._Element) -> OsmStats:
             if ref and ref not in stats.node_ids:
                 stats.missing_refs += 1
 
+    lanelet_way_usage = Counter(
+        member.get("ref")
+        for relation in relations
+        if _tags(relation).get("type") == "lanelet"
+        for member in relation.findall("member")
+        if member.get("role") in {"left", "right"} and member.get("ref")
+    )
     for relation in relations:
         relation_id = relation.get("id", "")
         if relation_id:
@@ -602,7 +627,7 @@ def _collect_osm_stats(root: etree._Element) -> OsmStats:
             roles = Counter(member.get("role", "") for member in relation.findall("member"))
             if not roles.get("left") or not roles.get("right"):
                 stats.lanelet_missing_boundaries += 1
-            lanelet_detail = _lanelet_detail(relation, stats)
+            lanelet_detail = _lanelet_detail(relation, stats, lanelet_way_usage)
             stats.lanelet_details.append(lanelet_detail)
             if subtype in {"crosswalk", "ped_crossing", "pedestrian_crossing"}:
                 stats.crosswalk_areas += 1
@@ -747,7 +772,10 @@ def _collect_opendrive_stats(root: etree._Element) -> OpenDriveStats:
     stats.duplicate_road_ids = len(road_ids) - len(set(road_ids))
     stats.duplicate_junction_ids = len(junction_ids) - len(set(junction_ids))
     road_id_set = set(road_ids)
+    road_by_id = {road.get("id", ""): road for road in roads}
+    road_section_counts: Dict[str, int] = {}
     road_lane_ids: Dict[str, set] = {}
+    road_lane_section_ids: Dict[Tuple[str, int], set] = {}
     road_lane_keys: Dict[Tuple[str, str], List[str]] = {}
 
     for road in roads:
@@ -777,6 +805,7 @@ def _collect_opendrive_stats(root: etree._Element) -> OpenDriveStats:
             if geometry_length is None or geometry_length <= 0.0:
                 stats.zero_length_geometries += 1
         lane_sections = _xpath_local(road, "./*[local-name()='lanes']/*[local-name()='laneSection']")
+        road_section_counts[road_id] = len(lane_sections)
         section_starts = [_float(section.get("s")) or 0.0 for section in lane_sections]
         for section_index, lane_section in enumerate(lane_sections):
             section_s = lane_section.get("s", "")
@@ -795,7 +824,24 @@ def _collect_opendrive_stats(root: etree._Element) -> OpenDriveStats:
                     lane_id = lane.get("id", "")
                     if road_id:
                         road_lane_ids.setdefault(road_id, set()).add(lane_id)
+                        road_lane_section_ids.setdefault(
+                            (road_id, section_index), set()
+                        ).add(lane_id)
                     if lane.get("type") != "driving":
+                        continue
+                    if lane_id == "0":
+                        stats.invalid_center_driving_lane_details.append(
+                            {
+                                "road_id": road_id,
+                                "source_lane_section": source_lane_section,
+                                "section_s": section_s,
+                                "declared_type": "driving",
+                                "location": (
+                                    f"/OpenDRIVE/road[@id='{road_id}']/lanes/"
+                                    f"laneSection[@s='{section_s}']/{side}/lane[@id='0']"
+                                ),
+                            }
+                        )
                         continue
                     stats.driving_lanes += 1
                     source_key = f"{road_id}|{source_lane_section}|{lane_id}"
@@ -913,11 +959,69 @@ def _collect_opendrive_stats(root: etree._Element) -> OpenDriveStats:
             for lane_link in lane_links:
                 from_lane = lane_link.get("from", "")
                 to_lane = lane_link.get("to", "")
+                contact_point = connection.get("contactPoint", "")
                 issues: List[str] = []
                 if incoming and from_lane not in road_lane_ids.get(incoming, set()):
                     issues.append(f"from lane {from_lane} not found on incomingRoad {incoming}")
                 if connecting and to_lane not in road_lane_ids.get(connecting, set()):
                     issues.append(f"to lane {to_lane} not found on connectingRoad {connecting}")
+                incoming_keys = road_lane_keys.get((incoming, from_lane), [])
+                connecting_keys = road_lane_keys.get((connecting, to_lane), [])
+                fallback_incoming_key = (
+                    _last_lane_key(incoming_keys)
+                    if contact_point == "start"
+                    and not _lane_drives_against_reference(from_lane)
+                    else _first_lane_key(incoming_keys)
+                )
+                fallback_incoming_section = (
+                    int(fallback_incoming_key.split("|")[1])
+                    if fallback_incoming_key
+                    else None
+                )
+                incoming_section_index = _incoming_junction_section_index(
+                    road_by_id.get(incoming),
+                    junction.get("id", ""),
+                    fallback_incoming_section,
+                )
+                incoming_key = (
+                    _lane_key_for_section(incoming_keys, incoming_section_index)
+                    if incoming_section_index is not None
+                    else fallback_incoming_key
+                )
+                if contact_point == "start":
+                    connecting_section_index = 0
+                    reverse = _lane_drives_against_reference(to_lane)
+                else:
+                    connecting_section_index = max(
+                        0, road_section_counts.get(connecting, 1) - 1
+                    )
+                    reverse = not _lane_drives_against_reference(to_lane)
+                connecting_key = _lane_key_for_section(
+                    connecting_keys, connecting_section_index
+                )
+                incoming_lane_exists = (
+                    from_lane
+                    in road_lane_section_ids.get(
+                        (incoming, incoming_section_index), set()
+                    )
+                    if incoming_section_index is not None
+                    else from_lane in road_lane_ids.get(incoming, set())
+                )
+                connecting_lane_exists = to_lane in road_lane_section_ids.get(
+                    (connecting, connecting_section_index), set()
+                )
+                if incoming and from_lane in road_lane_ids.get(incoming, set()) and not incoming_lane_exists:
+                    issues.append(
+                        f"from lane {from_lane} is absent at incomingRoad {incoming} junction contact section"
+                    )
+                if connecting and to_lane in road_lane_ids.get(connecting, set()) and not connecting_lane_exists:
+                    issues.append(
+                        f"to lane {to_lane} is absent at connectingRoad {connecting} contactPoint {contact_point}"
+                    )
+                incoming_road = road_by_id.get(incoming)
+                if incoming_road is not None and incoming_road.get("rule") == "LHT":
+                    reverse = not reverse
+
                 detail = {
                     "junction_id": junction.get("id", ""),
                     "connection_id": connection.get("id", ""),
@@ -925,8 +1029,9 @@ def _collect_opendrive_stats(root: etree._Element) -> OpenDriveStats:
                     "connecting_road": connecting,
                     "from_lane": from_lane,
                     "to_lane": to_lane,
-                    "source_key": _last_lane_key(road_lane_keys.get((incoming, from_lane), [])),
-                    "target_key": _first_lane_key(road_lane_keys.get((connecting, to_lane), [])),
+                    "contact_point": contact_point,
+                    "source_key": incoming_key,
+                    "target_key": connecting_key,
                     "edge_type": "junction_laneLink",
                     "issues": issues,
                     "location": (
@@ -935,7 +1040,7 @@ def _collect_opendrive_stats(root: etree._Element) -> OpenDriveStats:
                         f"[@from='{from_lane}'][@to='{to_lane}']"
                     ),
                 }
-                if _lane_drives_against_reference(from_lane):
+                if reverse:
                     detail["source_key"], detail["target_key"] = (
                         detail["target_key"],
                         detail["source_key"],
@@ -996,6 +1101,31 @@ def _opendrive_structure_check(stats: OpenDriveStats) -> DiagnosticCheck:
         ),
         hint="; ".join(failures),
         details=[_opendrive_detail(stats)],
+    )
+
+
+def _opendrive_center_lane_conformance_check(stats: OpenDriveStats) -> DiagnosticCheck:
+    invalid = stats.invalid_center_driving_lane_details
+    return DiagnosticCheck(
+        stage="diagnosis",
+        category="opendrive-center-lane-conformance",
+        status="WARN" if invalid else "PASS",
+        summary=(
+            "OpenDRIVE lane id 0 is declared as driving and is excluded from the drivable-lane inventory."
+            if invalid
+            else "OpenDRIVE center lanes are not declared as drivable lanes."
+        ),
+        source=f"invalid_center_driving_lanes={len(invalid)}",
+        method=(
+            "Treat lane id 0 as the OpenDRIVE road reference-line lane; only non-zero driving lanes "
+            "participate in conversion coverage and topology checks."
+        ),
+        hint=(
+            "Change center lane type to none in the source map when standards conformance is required."
+            if invalid
+            else ""
+        ),
+        details=invalid[:500],
     )
 
 
@@ -1367,14 +1497,18 @@ def _add_topology_edge(
 
 
 def _target_source_key_adjacency_edges(
-    lanelet_details: Sequence[Dict[str, object]], tolerance_m: float = 0.5
+    lanelet_details: Sequence[Dict[str, object]], tolerance_m: float = 1.0
 ) -> set:
     starts: Dict[str, List[Dict[str, object]]] = {}
+    starts_by_boundary_node: Dict[str, List[Dict[str, object]]] = {}
     spatial_starts: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
     for detail in lanelet_details:
         start_key = str(detail.get("start_key", ""))
         if start_key:
             starts.setdefault(start_key, []).append(detail)
+            for node_id in set(start_key.split("|")):
+                if node_id:
+                    starts_by_boundary_node.setdefault(node_id, []).append(detail)
         start_point = _tuple_point(detail.get("center_start_xy"))
         if start_point is not None:
             bucket = _spatial_bucket(start_point, tolerance_m)
@@ -1403,6 +1537,9 @@ def _target_source_key_adjacency_edges(
         candidates: Dict[str, Dict[str, object]] = {}
         for next_detail in starts.get(end_key, []):
             candidates[str(next_detail.get("lanelet_id", id(next_detail)))] = next_detail
+        for node_id in set(end_key.split("|")) if end_key else set():
+            for next_detail in starts_by_boundary_node.get(node_id, []):
+                candidates[str(next_detail.get("lanelet_id", id(next_detail)))] = next_detail
         if end_point is not None:
             end_bucket = _spatial_bucket(end_point, tolerance_m)
             for dx in (-1, 0, 1):
@@ -1413,13 +1550,25 @@ def _target_source_key_adjacency_edges(
                         start_point = _tuple_point(
                             next_detail.get("center_start_xy")
                         )
+                        gap = (
+                            math.dist(end_point, start_point)
+                            if start_point is not None
+                            else float("inf")
+                        )
+                        next_start_key = str(next_detail.get("start_key", ""))
                         if (
-                            start_point is not None
-                            and math.hypot(
-                                end_point[0] - start_point[0],
-                                end_point[1] - start_point[1],
+                            gap <= tolerance_m
+                            and (
+                                gap <= 0.5
+                                or (
+                                    end_key
+                                    and next_start_key
+                                    and bool(
+                                        set(end_key.split("|"))
+                                        & set(next_start_key.split("|"))
+                                    )
+                                )
                             )
-                            <= tolerance_m
                         ):
                             candidates[
                                 str(next_detail.get("lanelet_id", id(next_detail)))
@@ -1482,6 +1631,26 @@ def _match_highways_to_lanelets(
             score = _point_distance_m(source_mid, target_mid)
             if best is None or score < best[0]:
                 best = (score, lanelet)
+        mapping_status = "geometry_match"
+        if best is None or best[0] > threshold_m:
+            nodes = [str(node) for node in highway.get("nodes", [])]
+            coordinates = source.node_lonlat if source_mid_lonlat is not None else source.node_xy
+            polyline = [coordinates[node] for node in nodes if node in coordinates]
+            if len(polyline) >= 2:
+                for lanelet in target_lanelets:
+                    target_mid = (
+                        _tuple_point(lanelet.get("center_mid_lonlat"))
+                        if source_mid_lonlat is not None
+                        else None
+                    ) or _tuple_point(lanelet.get("center_mid_xy"))
+                    if target_mid is None:
+                        continue
+                    distance = _point_to_polyline_distance_m(
+                        target_mid, polyline, geographic=source_mid_lonlat is not None
+                    )
+                    if best is None or distance < best[0]:
+                        best = (distance, lanelet)
+                        mapping_status = "geometry_polyline_match"
         if best is not None and best[0] <= threshold_m:
             matches.append(
                 {
@@ -1489,7 +1658,7 @@ def _match_highways_to_lanelets(
                     "source_highway": highway.get("highway", ""),
                     "target_lanelet_id": best[1].get("lanelet_id", ""),
                     "distance_m": round(best[0], 3),
-                    "mapping_status": "geometry_match",
+                    "mapping_status": mapping_status,
                     "source_location": highway.get("location", ""),
                     "target_location": best[1].get("location", ""),
                 }
@@ -1504,6 +1673,30 @@ def _match_highways_to_lanelets(
                 }
             )
     return matches, unmatched
+
+
+def _point_to_polyline_distance_m(
+    point: Tuple[float, float],
+    polyline: Sequence[Tuple[float, float]],
+    *,
+    geographic: bool,
+) -> float:
+    if geographic:
+        x_scale = 111320.0 * math.cos(math.radians(point[1]))
+        y_scale = 110540.0
+    else:
+        x_scale = y_scale = 1.0
+    nearest = float("inf")
+    for start, end in zip(polyline, polyline[1:]):
+        ax = (start[0] - point[0]) * x_scale
+        ay = (start[1] - point[1]) * y_scale
+        bx = (end[0] - point[0]) * x_scale
+        by = (end[1] - point[1]) * y_scale
+        dx, dy = bx - ax, by - ay
+        scale = dx * dx + dy * dy
+        fraction = max(0.0, min(1.0, -(ax * dx + ay * dy) / scale)) if scale else 0.0
+        nearest = min(nearest, math.hypot(ax + fraction * dx, ay + fraction * dy))
+    return nearest
 
 
 def _lanelet_source_edges(
@@ -1601,6 +1794,43 @@ def _first_lane_key(keys: Sequence[str]) -> str:
 
 def _last_lane_key(keys: Sequence[str]) -> str:
     return keys[-1] if keys else ""
+
+
+def _incoming_junction_section_index(
+    road: Optional[etree._Element],
+    junction_id: str,
+    fallback: Optional[int],
+) -> Optional[int]:
+    if road is None:
+        return fallback
+    for kind in ("successor", "predecessor"):
+        links = _xpath_local(
+            road,
+            f"./*[local-name()='link']/*[local-name()='{kind}']",
+        )
+        if any(
+            link.get("elementType") == "junction"
+            and link.get("elementId", "") == junction_id
+            for link in links
+        ):
+            sections = _xpath_local(
+                road, "./*[local-name()='lanes']/*[local-name()='laneSection']"
+            )
+            return len(sections) - 1 if kind == "successor" else 0
+    return fallback
+
+
+def _lane_key_for_section(keys: Sequence[str], section_index: int) -> str:
+    section_text = str(section_index)
+    return next(
+        (
+            str(key)
+            for key in keys
+            if len(str(key).split("|")) == 3
+            and str(key).split("|")[1] == section_text
+        ),
+        "",
+    )
 
 
 def _lane_id_sort_key(value: str) -> Tuple[int, str]:
@@ -1904,9 +2134,9 @@ def _osm_highway_to_lanelet_mapping_check(source: OsmStats, target: OsmStats) ->
         source=f"source_highways={expected}, highway_types={_counter(source.highway_types)}",
         target=f"target_lanelets={target.lanelets}, matched_highways={matched}",
         method=(
-            "Match every source OSM highway way to the nearest generated Lanelet2 lanelet by "
-            "centerline midpoint distance. This is geometry_match provenance because "
-            "the OSM->CommonRoad->Lanelet2 chain does not preserve source way ids."
+            "Match source OSM highways to generated Lanelet2 centerline midpoints; "
+            "for long highways, check point-to-source-polyline distance when midpoint "
+            "matching fails. This is geometry provenance because source way ids are not preserved."
         ),
         hint=(
             f"unmatched_source_highways={len(unmatched)}"
@@ -2618,57 +2848,20 @@ def _preservation_warning(
     )
 
 
-def _write_text_report(path: Path, payload: Dict[str, object]) -> None:
-    summary = payload["summary"]
-    lines = [
-        f"{payload['conversion']} Conversion Diagnostics",
-        "=" * 80,
-        f"Source: {_relative(Path(str(payload['source'])))}",
-        f"Target: {_relative(Path(str(payload['target'])))}",
-        f"Result: {payload['result']}",
-        (
-            f"PASS={summary['pass']} WARN={summary['warn']} FAIL={summary['fail']} "
-            f"REVIEW={summary['review']} SKIP={summary['skip']}"
-        ),
-        "",
-        "Stage1 Acceptance",
-        "-" * 80,
-    ]
-    for item in payload.get("acceptance", []):
-        lines.append(f"[{item.get('status', '')}] {item.get('category', '')}: {item.get('summary', '')}")
-        if item.get("hint"):
-            lines.append(f"  hint: {item['hint']}")
-    lines.extend(["", "Stage2 Diagnostics", "-" * 80])
-    diagnostics = payload.get("diagnostics", {})
-    for section in ("target_conformance", "topology", "element_mapping"):
-        lines.append(f"{section}:")
-        for item in diagnostics.get(section, []):
-            lines.append(f"  [{item.get('status', '')}] {item.get('category', '')}: {item.get('summary', '')}")
-            if item.get("source"):
-                lines.append(f"    source: {item['source']}")
-            if item.get("target"):
-                lines.append(f"    target: {item['target']}")
-            if item.get("method"):
-                lines.append(f"    method: {item['method']}")
-            if item.get("hint"):
-                lines.append(f"    hint: {item['hint']}")
-            details = item.get("details") or []
-            if details:
-                lines.append(f"    details: {len(details)} item(s) in JSON")
-                first_detail = details[0]
-                if isinstance(first_detail, dict):
-                    preview_keys = list(first_detail.keys())[:6]
-                    preview = {
-                        key: _text_preview_value(first_detail.get(key))
-                        for key in preview_keys
-                    }
-                    lines.append(f"    first_detail: {json.dumps(preview, ensure_ascii=False)[:800]}")
-        lines.append("")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def _count_statuses(checks: Sequence[DiagnosticCheck]) -> Dict[str, int]:
     return {status.lower(): sum(1 for check in checks if check.status == status) for status in STATUS_ORDER}
+
+
+def _merge_status_counts(*groups: object) -> Dict[str, int]:
+    merged = {status.lower(): 0 for status in STATUS_ORDER}
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for status in merged:
+            value = group.get(status, 0)
+            if isinstance(value, int):
+                merged[status] += value
+    return merged
 
 
 def _result_from_counts(counts: Dict[str, int]) -> str:
@@ -2723,16 +2916,6 @@ def _osm_detail(stats: OsmStats) -> Dict[str, object]:
     return data
 
 
-def _text_preview_value(value: object) -> object:
-    """Keep the readable report compact while full evidence remains in JSON."""
-    if isinstance(value, list):
-        return f"<{len(value)} items>"
-    if isinstance(value, dict):
-        return f"<{len(value)} fields>"
-    text = str(value)
-    return text if len(text) <= 160 else text[:157] + "..."
-
-
 def _opendrive_detail(stats: OpenDriveStats) -> Dict[str, object]:
     data = asdict(stats)
     data["signal_types"] = dict(stats.signal_types)
@@ -2751,7 +2934,9 @@ def _tags(element: etree._Element) -> Dict[str, str]:
     }
 
 
-def _lanelet_detail(relation: etree._Element, stats: OsmStats) -> Dict[str, object]:
+def _lanelet_detail(
+    relation: etree._Element, stats: OsmStats, way_usage: Counter
+) -> Dict[str, object]:
     lanelet_id = relation.get("id", "")
     tags = _tags(relation)
     members = relation.findall("member")
@@ -2793,6 +2978,27 @@ def _lanelet_detail(relation: etree._Element, stats: OsmStats) -> Dict[str, obje
         issues.append(f"left way {left_way} has missing node coordinates")
     if right_nodes and len(right_points) != len(right_nodes):
         issues.append(f"right way {right_way} has missing node coordinates")
+    reversed_boundary = ""
+    if len(left_points) >= 2 and len(right_points) >= 2:
+        aligned = (
+            math.dist(left_points[0], right_points[0])
+            + math.dist(left_points[-1], right_points[-1])
+        )
+        opposed = (
+            math.dist(left_points[0], right_points[-1])
+            + math.dist(left_points[-1], right_points[0])
+        )
+        if opposed + 1e-6 < aligned:
+            if way_usage[left_way] >= way_usage[right_way]:
+                left_nodes = list(reversed(left_nodes))
+                left_points.reverse()
+                left_lonlat.reverse()
+                reversed_boundary = "left"
+            else:
+                right_nodes = list(reversed(right_nodes))
+                right_points.reverse()
+                right_lonlat.reverse()
+                reversed_boundary = "right"
     left_length = _polyline_length(left_points)
     right_length = _polyline_length(right_points)
     area = _lanelet_area(left_points, right_points)
@@ -2860,6 +3066,7 @@ def _lanelet_detail(relation: etree._Element, stats: OsmStats) -> Dict[str, obje
             "source:osm:only_successor_lanelets", ""
         ),
         "virtual_boundaries": virtual_boundaries,
+        "reversed_boundary": reversed_boundary,
         "issues": issues,
         "location": f"/osm/relation[@id='{lanelet_id}']",
     }

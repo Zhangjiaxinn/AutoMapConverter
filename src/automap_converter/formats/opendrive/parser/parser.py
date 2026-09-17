@@ -106,6 +106,8 @@ def parse_opendrive(file_path: Path, odr_conf: open_drive_config = open_drive_co
                 elem.tag = etree.QName(elem).localname
         etree.cleanup_namespaces(root_node)
 
+    _normalize_textual_map_ids(root_node)
+
     opendrive = OpenDrive()
 
     # Header
@@ -122,6 +124,50 @@ def parse_opendrive(file_path: Path, odr_conf: open_drive_config = open_drive_co
         parse_opendrive_road(opendrive, road)
 
     return opendrive
+
+
+def _normalize_textual_map_ids(root_node: etree._ElementTree) -> None:
+    """Keep the integer-based internal model compatible with textual OpenDRIVE IDs."""
+    for element_name in ("road", "junction"):
+        elements = root_node.findall(element_name)
+        values = [element.get("id") for element in elements if element.get("id") is not None]
+        numeric = {int(value) for value in values if value.lstrip("-").isdigit()}
+        next_id = max(numeric | {0}) + 1
+        mapping = {}
+        for value in values:
+            if value.lstrip("-").isdigit() or value in mapping:
+                continue
+            while next_id in numeric:
+                next_id += 1
+            mapping[value] = str(next_id)
+            numeric.add(next_id)
+            next_id += 1
+        if not mapping:
+            continue
+
+        def replace(element, attribute):
+            value = element.get(attribute)
+            if value in mapping:
+                element.set(attribute, mapping[value])
+
+        for element in elements:
+            replace(element, "id")
+        if element_name == "road":
+            for road in root_node.findall("road"):
+                for link in road.findall("link/*"):
+                    if link.get("elementType") == "road" or link.tag == "neighbor":
+                        replace(link, "elementId")
+            for connection in root_node.findall("junction/connection"):
+                for attribute in ("incomingRoad", "connectingRoad", "linkedRoad"):
+                    replace(connection, attribute)
+        else:
+            for road in root_node.findall("road"):
+                replace(road, "junction")
+                for link in road.findall("link/*"):
+                    if link.get("elementType") == "junction":
+                        replace(link, "elementId")
+            for reference in root_node.findall("junctionGroup/junctionReference"):
+                replace(reference, "junction")
 
 
 def parse_opendrive_road_link(new_road: Road, opendrive_road_link: etree.ElementTree):
@@ -226,17 +272,17 @@ def parse_opendrive_road_geometry(
             defaultval(road_geometry.find("spiral").get("curvStart"), "spiral.curvStart")
         )
         curv_end = float(defaultval(road_geometry.find("spiral").get("curvEnd"), "spiral.curvEnd"))
+        heading = float(road_geometry.get("hdg")) - float(offset["hdg"])
+        length = float(road_geometry.get("length"))
         if np.isclose(curv_start, curv_end):
-            raise AttributeError(
-                "Curvature at the start and at the end of a spiral must be different"
+            if np.isclose(curv_start, 0):
+                new_road.plan_view.add_line(start_coord, heading, length)
+            else:
+                new_road.plan_view.add_arc(start_coord, heading, length, curv_start)
+        else:
+            new_road.plan_view.add_spiral(
+                start_coord, heading, length, curv_start, curv_end
             )
-        new_road.plan_view.add_spiral(
-            start_coord,
-            float(road_geometry.get("hdg")) - float(offset["hdg"]),
-            float(road_geometry.get("length")),
-            curv_start,
-            curv_end,
-        )
     elif road_geometry.find("arc") is not None:
         new_road.plan_view.add_arc(
             start_coord,
@@ -819,7 +865,9 @@ def parse_opendrive_junction(opendrive: OpenDrive, junction: etree.ElementTree):
 
         new_connection.id = connection.get("id")
         new_connection.incomingRoad = connection.get("incomingRoad")
-        new_connection.connectingRoad = connection.get("connectingRoad")
+        new_connection.connectingRoad = connection.get("connectingRoad") or connection.get(
+            "linkedRoad"
+        )
         new_connection.contactPoint = connection.get("contactPoint")
 
         for laneLink in connection.findall("laneLink"):

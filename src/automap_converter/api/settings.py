@@ -21,6 +21,11 @@ class RuntimeSettings:
     lanelet2_routing_enrichment: bool = True
     osm_extract_sublayer: bool = True
     opendrive_version: str = "1.6.1"
+    raster_resolution_m: float = 0.5
+    raster_padding_m: float = 5.0
+    raster_supersampling: int = 4
+    raster_topology_tolerance_m: float = 1.0
+    raster_max_output_pixels: int = 40_000_000
     launch_viewer: bool = False
     diagnose_target_conformance: bool = True
     diagnose_topology: bool = True
@@ -66,6 +71,35 @@ def _version(value: object) -> str:
     return version
 
 
+def _float(
+    mapping: Mapping[str, object], key: str, default: float, *, minimum: float
+) -> float:
+    value = mapping.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Configuration field {key!r} must be numeric.")
+    result = float(value)
+    if result < minimum:
+        raise ValueError(f"Configuration field {key!r} must be at least {minimum}.")
+    return result
+
+
+def _int(
+    mapping: Mapping[str, object],
+    key: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    value = mapping.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Configuration field {key!r} must be an integer.")
+    if value < minimum or (maximum is not None and value > maximum):
+        range_text = f"{minimum}..{maximum}" if maximum is not None else f">= {minimum}"
+        raise ValueError(f"Configuration field {key!r} must be {range_text}.")
+    return value
+
+
 def _load_yaml(path: Path) -> Mapping[str, object]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return _mapping(raw, "root")
@@ -83,6 +117,7 @@ def load_runtime_settings(config_path: str | Path | None = None) -> RuntimeSetti
         if validation_path.is_file():
             root.update(_load_yaml(validation_path))
     conversion = _mapping(root.get("conversion"), "conversion")
+    raster = _mapping(root.get("raster"), "raster")
     stage1 = _mapping(root.get("stage1"), "stage1")
     diagnostics = _mapping(root.get("diagnostics"), "diagnostics")
     return RuntimeSettings(
@@ -91,6 +126,15 @@ def load_runtime_settings(config_path: str | Path | None = None) -> RuntimeSetti
         ),
         osm_extract_sublayer=_bool(conversion, "osm_extract_sublayer", True),
         opendrive_version=_version(conversion.get("opendrive_version", "1.6.1")),
+        raster_resolution_m=_float(raster, "resolution_m", 0.5, minimum=0.01),
+        raster_padding_m=_float(raster, "padding_m", 5.0, minimum=0.0),
+        raster_supersampling=_int(raster, "supersampling", 4, minimum=1, maximum=8),
+        raster_topology_tolerance_m=_float(
+            raster, "topology_tolerance_m", 1.0, minimum=0.01
+        ),
+        raster_max_output_pixels=_int(
+            raster, "max_output_pixels", 40_000_000, minimum=1
+        ),
         launch_viewer=_bool(stage1, "launch_viewer", False),
         diagnose_target_conformance=_bool(diagnostics, "target_conformance", True),
         diagnose_topology=_bool(diagnostics, "topology", True),

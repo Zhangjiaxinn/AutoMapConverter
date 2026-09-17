@@ -139,6 +139,23 @@ def offset_polyline(waypoints: List[np.ndarray], size: float, at_first: bool) ->
     return new_line
 
 
+def _parallel_normal(waypoints: List[Point], index: int) -> np.ndarray:
+    current = np.array([waypoints[index].x, waypoints[index].y], dtype=float)
+    for candidate in range(index + 1, len(waypoints)):
+        point = np.array([waypoints[candidate].x, waypoints[candidate].y], dtype=float)
+        direction = point - current
+        length = np.linalg.norm(direction)
+        if length > 1e-9:
+            return np.array([direction[1], -direction[0]]) / length
+    for candidate in range(index - 1, -1, -1):
+        point = np.array([waypoints[candidate].x, waypoints[candidate].y], dtype=float)
+        direction = current - point
+        length = np.linalg.norm(direction)
+        if length > 1e-9:
+            return np.array([direction[1], -direction[0]]) / length
+    return np.zeros(2)
+
+
 def create_parallels(
     waypoints: List[np.ndarray], width: float, points: bool = False
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
@@ -155,20 +172,7 @@ def create_parallels(
     if not points:
         waypoints = [Point(None, x[0], x[1]) for x in waypoints]
     for waypoint_counter, current_point in enumerate(waypoints):
-        x1 = current_point.x
-        y1 = current_point.y
-        if waypoint_counter + 1 < len(waypoints):
-            x2 = waypoints[waypoint_counter + 1].x
-            y2 = waypoints[waypoint_counter + 1].y
-        else:
-            x1 = waypoints[waypoint_counter - 1].x
-            y1 = waypoints[waypoint_counter - 1].y
-            x2 = current_point.x
-            y2 = current_point.y
-        vector = [x2 - x1, y2 - y1]
-        orthogonal_vector = np.array([vector[1], -vector[0]])
-        magnitude = np.linalg.norm(orthogonal_vector)
-        orthogonal_vector = orthogonal_vector / magnitude * width
+        orthogonal_vector = _parallel_normal(waypoints, waypoint_counter) * width
         left_bound.append(
             np.array(
                 [
@@ -207,23 +211,10 @@ def create_tilted_parallels(
     if not points:
         waypoints = [Point(None, x[0], x[1]) for x in waypoints]
     for waypoint_counter, current_point in enumerate(waypoints):
-        x1 = current_point.x
-        y1 = current_point.y
-        if waypoint_counter + 1 < len(waypoints):
-            x2 = waypoints[waypoint_counter + 1].x
-            y2 = waypoints[waypoint_counter + 1].y
-        else:
-            x1 = waypoints[waypoint_counter - 1].x
-            y1 = waypoints[waypoint_counter - 1].y
-            x2 = current_point.x
-            y2 = current_point.y
-        vector = [x2 - x1, y2 - y1]
-        orthogonal_vector = np.array([vector[1], -vector[0]])
-        magnitude = np.linalg.norm(orthogonal_vector)
         width = width1 * (
             1 - waypoint_counter / (len(waypoints) - 1)
         ) + width2 * waypoint_counter / (len(waypoints) - 1)
-        orthogonal_vector = orthogonal_vector / magnitude * width
+        orthogonal_vector = _parallel_normal(waypoints, waypoint_counter) * width
         left_bound.append(
             np.array(
                 [
@@ -298,9 +289,15 @@ def get_inner_bezier_point(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, d: fl
     :return: the new control point
     """
     vector1 = p1 - p2
-    vector1 /= np.linalg.norm(vector1)
     vector2 = p3 - p2
-    vector2 /= np.linalg.norm(vector2)
+    length1 = np.linalg.norm(vector1)
+    length2 = np.linalg.norm(vector2)
+    if length2 < 1e-9:
+        return np.array(p2, dtype=float)
+    if length1 < 1e-9:
+        return p2 + d * vector2
+    vector1 /= length1
+    vector2 /= length2
     bisector = vector1 + vector2
     if np.linalg.norm(bisector) < 0.000001:
         # if vectors are almost parallel use vector2 instead of orthogonal of bisector
@@ -733,6 +730,49 @@ def filter_points(lines: List[List[np.ndarray]], threshold: float) -> List[List[
     nr_of_waypoints = len(lines[0])
     for line in lines:
         assert len(line) == nr_of_waypoints, "all lines must have the same number of waypoints"
+
+    if nr_of_waypoints > 256:
+        keep = {0, nr_of_waypoints - 1}
+        arrays = []
+        for line in lines:
+            dimensions = {np.asarray(point).size for point in line}
+            if len(dimensions) == 1:
+                arrays.append(np.asarray(line, dtype=float))
+            else:
+                dimension = max(dimensions)
+                padded = []
+                for point in line:
+                    coordinates = np.asarray(point, dtype=float).reshape(-1)
+                    padded.append(np.pad(coordinates, (0, dimension - len(coordinates))))
+                arrays.append(np.asarray(padded))
+        intervals = [(0, nr_of_waypoints - 1)]
+        while intervals:
+            start, end = intervals.pop()
+            if end - start <= 1:
+                continue
+            distances = np.zeros(end - start - 1)
+            for points in arrays:
+                delta = points[end] - points[start]
+                offsets = points[start + 1 : end] - points[start]
+                length_squared = float(np.dot(delta, delta))
+                if length_squared < 1e-18:
+                    line_distances = np.linalg.norm(offsets, axis=1)
+                else:
+                    projection = offsets @ delta
+                    squared = np.einsum("ij,ij->i", offsets, offsets)
+                    line_distances = np.sqrt(
+                        np.maximum(squared - projection * projection / length_squared, 0.0)
+                    )
+                distances = np.maximum(distances, line_distances)
+            split = start + 1 + int(np.argmax(distances))
+            if distances[split - start - 1] > threshold:
+                keep.add(split)
+                intervals.extend(((start, split), (split, end)))
+        indices = sorted(keep)
+        if len(indices) == 2:
+            midpoint = nr_of_waypoints // 2
+            indices.insert(1, midpoint)
+        return [[line[index] for index in indices] for line in lines]
 
     result = [line[:1] for line in lines]
     delete_interval = (1, 1)

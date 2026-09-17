@@ -3112,6 +3112,11 @@ class Lanelet2OpendriveConverter:
                 self._append_lanelet2_metadata(
                     signal_el, "regulatory_element", str(reg_id), reg.tag_dict
                 )
+                for way_id in getattr(reg, "refers", []) or []:
+                    if self.get_way_points(str(way_id)):
+                        self._append_user_data(
+                            signal_el, "lanelet2:source_way_id", str(way_id)
+                        )
                 self._apply_signal_geometry_pose(
                     signal_el,
                     group,

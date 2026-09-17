@@ -682,7 +682,8 @@ def link_third_degree(node: GraphNode, edges: List[Union[GraphEdge, CombinedEdge
     :param node: the node of the intersection
     :param edges: edges to link
     """
-    assert node.get_degree() == 3
+    if len(edges) != 3:
+        raise ValueError("three logical edges are required for a third-degree junction")
     for index, edge in enumerate(edges):
         incoming, outgoing = get_incomings_outgoings(edge, node)
         turnlanes = []
@@ -837,7 +838,16 @@ def link_high_degree(node: GraphNode, edges: List[Union[GraphEdge, CombinedEdge]
 
 
 def get_forbidden_turns(edge: GraphEdge, node: GraphNode) -> Dict[str, bool]:
-    if edge.node1 == node:
+    if isinstance(edge, CombinedEdge):
+        # A CombinedEdge represents two one-way edges at the same junction.
+        # Its incoming traffic reaches the combination node along edge2.
+        if edge.node1 == node:
+            restrictions = edge.edge2.forward_restrictions
+        elif edge.node2 == node:
+            restrictions = edge.edge1.forward_restrictions
+        else:
+            raise ValueError("malformed graph")
+    elif edge.node1 == node:
         restrictions = edge.backward_restrictions
     elif edge.node2 == node:
         restrictions = edge.forward_restrictions
@@ -865,14 +875,21 @@ def rotate_restrictions(edge: GraphEdge, node: GraphNode, direction: str):
     :return:
     """
     assert direction in ("left", "right")
-    if edge.node1 == node:
+    if isinstance(edge, CombinedEdge):
+        if edge.node1 == node:
+            restrictions = edge.edge2.forward_restrictions
+        elif edge.node2 == node:
+            restrictions = edge.edge1.forward_restrictions
+        else:
+            raise ValueError("malformed graph")
+    elif edge.node1 == node:
         restrictions = edge.backward_restrictions
     elif edge.node2 == node:
         restrictions = edge.forward_restrictions
     else:
         raise ValueError("malformed graph")
     if "no_straight_on" in restrictions:
-        restrictions -= "no_straight_on"
+        restrictions.discard("no_straight_on")
         restrictions.add("no_{}_turn".format(direction))
 
 

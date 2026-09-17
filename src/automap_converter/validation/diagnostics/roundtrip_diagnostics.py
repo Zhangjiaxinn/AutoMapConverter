@@ -6,19 +6,23 @@ import math
 import time
 import traceback
 from collections import Counter, deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from lxml import etree
+from shapely.geometry import LineString
+from shapely.strtree import STRtree
 
+from automap_converter.api.interface import (
+    lanelet2_to_opendrive,
+)
+from automap_converter.conversion.opendrive_to_commonroad.opendrive_conversion.network import (
+    Network,
+)
+from automap_converter.core.config.general_config import general_config
 from automap_converter.core.config.lanelet2_config import lanelet2_config
 from automap_converter.core.config.opendrive_config import open_drive_config
-from automap_converter.core.config.general_config import general_config
-from automap_converter.api.interface import (
-    lanelet_to_opendrive,
-)
-from automap_converter.conversion.opendrive_to_commonroad.opendrive_conversion.network import Network
 from automap_converter.formats.opendrive.parser.parser import parse_opendrive
 
 from ._workflow_runtime import (
@@ -27,9 +31,9 @@ from ._workflow_runtime import (
     convert_osm_to_lanelet2,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-ROUNDTRIP_ROOT = PROJECT_ROOT / "roundtrip_results"
+SAMPLES_ROOT = PROJECT_ROOT / "data" / "samples"
+ROUNDTRIP_ROOT = PROJECT_ROOT / "data" / "results" / "roundtrip"
 PROVENANCE_PREFIXES = ("lanelet2:", "source:", "conversion:")
 
 
@@ -75,11 +79,35 @@ class RoundtripSpec:
 def _lanelet2_to_opendrive(source: Path, target: Path, _: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     lanelet2_config.adjacencies = True
-    lanelet_to_opendrive(
+    lanelet2_to_opendrive(
         str(source),
         str(target),
-        lanelet2_conf=lanelet2_config,
-        odr_conf=open_drive_config,
+        lanelet_conf=lanelet2_config,
+        opendrive_conf=open_drive_config,
+    )
+
+
+def _opendrive_to_osm(source: Path, target: Path, intermediate_dir: Path) -> None:
+    """Compose OpenDRIVE -> Lanelet2 -> OSM for a roundtrip middle map."""
+
+    lanelet2_path = intermediate_dir / "opendrive_to_lanelet2.osm"
+    convert_opendrive_to_lanelet2(
+        source, lanelet2_path, intermediate_dir / "opendrive_to_lanelet2"
+    )
+    convert_lanelet2_to_osm(
+        lanelet2_path, target, intermediate_dir / "lanelet2_to_osm"
+    )
+
+
+def _osm_to_opendrive(source: Path, target: Path, intermediate_dir: Path) -> None:
+    """Compose OSM -> Lanelet2 -> OpenDRIVE for a roundtrip middle map."""
+
+    lanelet2_path = intermediate_dir / "osm_to_lanelet2.osm"
+    convert_osm_to_lanelet2(
+        source, lanelet2_path, intermediate_dir / "osm_to_lanelet2"
+    )
+    _lanelet2_to_opendrive(
+        lanelet2_path, target, intermediate_dir / "lanelet2_to_opendrive"
     )
 
 
@@ -89,7 +117,7 @@ SPECS: Dict[str, RoundtripSpec] = {
         pair="lanelet2-opendrive",
         source_format="lanelet2",
         intermediate_format="opendrive",
-        source_dir=PROJECT_ROOT / "maps/lanelet2",
+        source_dir=SAMPLES_ROOT / "lanelet2",
         source_suffix=".osm",
         first=_lanelet2_to_opendrive,
         second=convert_opendrive_to_lanelet2,
@@ -99,7 +127,7 @@ SPECS: Dict[str, RoundtripSpec] = {
         pair="lanelet2-opendrive",
         source_format="opendrive",
         intermediate_format="lanelet2",
-        source_dir=PROJECT_ROOT / "maps/opendrive",
+        source_dir=SAMPLES_ROOT / "opendrive",
         source_suffix=".xodr",
         first=convert_opendrive_to_lanelet2,
         second=_lanelet2_to_opendrive,
@@ -109,7 +137,7 @@ SPECS: Dict[str, RoundtripSpec] = {
         pair="lanelet2-osm",
         source_format="lanelet2",
         intermediate_format="osm",
-        source_dir=PROJECT_ROOT / "maps/lanelet2",
+        source_dir=SAMPLES_ROOT / "lanelet2",
         source_suffix=".osm",
         first=convert_lanelet2_to_osm,
         second=convert_osm_to_lanelet2,
@@ -119,10 +147,30 @@ SPECS: Dict[str, RoundtripSpec] = {
         pair="lanelet2-osm",
         source_format="osm",
         intermediate_format="lanelet2",
-        source_dir=PROJECT_ROOT / "maps/osm",
+        source_dir=SAMPLES_ROOT / "osm",
         source_suffix=".osm",
         first=convert_osm_to_lanelet2,
         second=convert_lanelet2_to_osm,
+    ),
+    "opendrive-osm-opendrive": RoundtripSpec(
+        name="opendrive-osm-opendrive",
+        pair="opendrive-osm",
+        source_format="opendrive",
+        intermediate_format="osm",
+        source_dir=SAMPLES_ROOT / "opendrive",
+        source_suffix=".xodr",
+        first=_opendrive_to_osm,
+        second=_osm_to_opendrive,
+    ),
+    "osm-opendrive-osm": RoundtripSpec(
+        name="osm-opendrive-osm",
+        pair="opendrive-osm",
+        source_format="osm",
+        intermediate_format="opendrive",
+        source_dir=SAMPLES_ROOT / "osm",
+        source_suffix=".osm",
+        first=_osm_to_opendrive,
+        second=_opendrive_to_osm,
     ),
 }
 
@@ -133,14 +181,12 @@ DEFAULT_SCENARIOS = {
         "basic_intersection_area.osm",
     ],
     "opendrive": [
-        "commonroad__straight_road.xodr",
+        "commonroad_straight_road.xodr",
         "highway_merge.xodr",
         "highway_intersection_test0.xodr",
     ],
     "osm": [
-        "garching_intersection.osm",
-        "munich_garching_small.osm",
-        "map_without_crossing_nodes.osm",
+        "ped_crossing.osm",
     ],
 }
 
@@ -202,7 +248,9 @@ def run_roundtrip(
         spec.second(clean_middle, result, intermediate_dir / "second")
         _record_stage(payload, current_stage, "PASS", _relative(result))
         current_stage = "roundtrip_feature_extraction"
-        result_features = extract_features(result, spec.source_format)
+        result_features = extract_features(
+            result, spec.source_format, prefer_geographic=source_features.geographic
+        )
         _record_stage(payload, current_stage, "PASS")
         current_stage = "metric_comparison"
         comparison = compare_feature_sets(source_features, result_features)
@@ -227,11 +275,8 @@ def run_roundtrip(
         payload["failed_metrics"] = ["roundtrip_execution"]
     payload["elapsed_seconds"] = round(time.time() - started, 3)
     json_path = case_dir / "roundtrip_diagnostics.json"
-    txt_path = case_dir / "roundtrip_diagnostics.txt"
     json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    _write_text_report(txt_path, payload)
     payload["diagnostics_json"] = _relative(json_path)
-    payload["diagnostics_txt"] = _relative(txt_path)
     return payload
 
 
@@ -268,19 +313,21 @@ def sanitize_intermediate(source: Path, target: Path, map_format: str) -> Dict[s
     return dict(removed)
 
 
-def extract_features(path: Path, map_format: str) -> FeatureSet:
+def extract_features(
+    path: Path, map_format: str, prefer_geographic: Optional[bool] = None
+) -> FeatureSet:
     if map_format == "opendrive":
         return _extract_opendrive(path)
     if map_format == "lanelet2":
-        return _extract_lanelet2(path)
+        return _extract_lanelet2(path, prefer_geographic)
     if map_format == "osm":
-        return _extract_osm(path)
+        return _extract_osm(path, prefer_geographic)
     raise ValueError(f"Unsupported roundtrip format: {map_format}")
 
 
-def _extract_lanelet2(path: Path) -> FeatureSet:
+def _extract_lanelet2(path: Path, prefer_geographic: Optional[bool] = None) -> FeatureSet:
     root = etree.parse(str(path)).getroot()
-    nodes, geographic = _read_osm_nodes(root)
+    nodes, geographic = _read_osm_nodes(root, prefer_geographic)
     ways = {
         str(way.get("id", "")): [
             nodes[ref]
@@ -291,6 +338,13 @@ def _extract_lanelet2(path: Path) -> FeatureSet:
     }
     features: List[Feature] = []
     semantics = Counter()
+    way_usage = Counter(
+        member.get("ref")
+        for relation in root.findall("relation")
+        if _tags(relation).get("type") == "lanelet"
+        for member in relation.findall("member")
+        if member.get("role") in {"left", "right"} and member.get("ref")
+    )
     for relation in root.findall("relation"):
         tags = _tags(relation)
         relation_type = tags.get("type", "")
@@ -310,7 +364,10 @@ def _extract_lanelet2(path: Path) -> FeatureSet:
         if _distance(left[0], right[-1]) + _distance(left[-1], right[0]) < _distance(
             left[0], right[0]
         ) + _distance(left[-1], right[-1]):
-            right = list(reversed(right))
+            if way_usage[left_id] >= way_usage[right_id]:
+                left = list(reversed(left))
+            else:
+                right = list(reversed(right))
         sample_count = max(8, min(40, max(len(left), len(right))))
         left_sample = _resample(left, sample_count)
         right_sample = _resample(right, sample_count)
@@ -341,9 +398,9 @@ def _extract_lanelet2(path: Path) -> FeatureSet:
     return feature_set
 
 
-def _extract_osm(path: Path) -> FeatureSet:
+def _extract_osm(path: Path, prefer_geographic: Optional[bool] = None) -> FeatureSet:
     root = etree.parse(str(path)).getroot()
-    nodes, geographic = _read_osm_nodes(root)
+    nodes, geographic = _read_osm_nodes(root, prefer_geographic)
     features: List[Feature] = []
     semantics = Counter()
     for node in root.findall("node"):
@@ -575,33 +632,58 @@ def _match_features(
     source_points: List[List[Tuple[float, float]]],
     target_points: List[List[Tuple[float, float]]],
 ) -> List[Match]:
-    candidates: List[Match] = []
+    indexed_targets = [
+        (index, LineString(points))
+        for index, points in enumerate(target_points)
+        if len(points) >= 2
+    ]
+    target_tree = (
+        STRtree([geometry for _, geometry in indexed_targets])
+        if indexed_targets
+        else None
+    )
+    selected: List[Match] = []
     for source_index, points in enumerate(source_points):
         sampled = _resample(points, 20)
-        for target_index, target_line in enumerate(target_points):
-            target_sampled = _resample(target_line, 20)
-            direct = _paired_mean_distance(sampled, target_sampled)
-            reverse = _paired_mean_distance(sampled, list(reversed(target_sampled)))
+        candidates: List[Match] = []
+        candidate_indices: List[int] = []
+        if target_tree is not None and len(points) >= 2:
+            source_geometry = LineString(points)
+            tree_indices = list(target_tree.query(source_geometry.envelope.buffer(10.0)))
+            if not tree_indices:
+                nearest = target_tree.nearest(source_geometry)
+                if nearest is not None:
+                    tree_indices = [nearest]
+            candidate_indices = [indexed_targets[int(index)][0] for index in tree_indices]
+        for target_index in candidate_indices:
+            target_line = target_points[target_index]
+            distances_and_positions = [
+                _point_to_polyline_distance_and_position(point, target_line)
+                for point in sampled
+            ]
+            mean_error = (
+                sum(item[0] for item in distances_and_positions)
+                / len(distances_and_positions)
+                if distances_and_positions
+                else math.inf
+            )
+            start_position = distances_and_positions[0][1]
+            end_position = distances_and_positions[-1][1]
             candidates.append(
                 Match(
                     source_index,
                     target_index,
-                    min(direct, reverse),
-                    reverse,
-                    direct <= reverse,
+                    mean_error,
+                    mean_error,
+                    end_position + 1e-9 >= start_position,
                 )
             )
-    selected: Dict[int, Match] = {}
-    used_targets = set()
-    for candidate in sorted(candidates, key=lambda item: item.mean_error_m):
-        if candidate.source_index in selected or candidate.target_index in used_targets:
-            continue
-        selected[candidate.source_index] = candidate
-        used_targets.add(candidate.target_index)
-    return [
-        selected.get(index, Match(index, -1, math.inf, math.inf, False))
-        for index in range(len(source_points))
-    ]
+        selected.append(
+            min(candidates, key=lambda item: item.mean_error_m)
+            if candidates
+            else Match(source_index, -1, math.inf, math.inf, False)
+        )
+    return selected
 
 
 def _metric_feature_points(
@@ -696,19 +778,25 @@ def _infer_topology(features: Sequence[Feature], geographic: bool) -> set[Tuple[
     return edges
 
 
-def _read_osm_nodes(root: etree._Element) -> Tuple[Dict[str, Tuple[float, float]], bool]:
+def _read_osm_nodes(
+    root: etree._Element, prefer_geographic: Optional[bool] = None
+) -> Tuple[Dict[str, Tuple[float, float]], bool]:
     nodes: Dict[str, Tuple[float, float]] = {}
     geographic_count = 0
     for node in root.findall("node"):
         tags = _tags(node)
         lon = _as_float(node.get("lon"))
         lat = _as_float(node.get("lat"))
-        if lon is not None and lat is not None:
+        local_x = _as_float(tags.get("local_x"))
+        local_y = _as_float(tags.get("local_y"))
+        if prefer_geographic is False:
+            if local_x is None or local_y is None:
+                continue
+            point = (local_x, local_y)
+        elif lon is not None and lat is not None:
             point = (lon, lat)
             geographic_count += 1
         else:
-            local_x = _as_float(tags.get("local_x"))
-            local_y = _as_float(tags.get("local_y"))
             if local_x is None or local_y is None:
                 continue
             point = (local_x, local_y)
@@ -757,6 +845,43 @@ def _paired_mean_distance(
     if not source or not target:
         return math.inf
     return sum(_distance(a, b) for a, b in zip(source, target)) / min(len(source), len(target))
+
+
+def _point_to_polyline_distance_and_position(
+    point: Tuple[float, float], polyline: Sequence[Tuple[float, float]]
+) -> Tuple[float, float]:
+    if not polyline:
+        return math.inf, 0.0
+    if len(polyline) == 1:
+        return _distance(point, polyline[0]), 0.0
+
+    best_distance = math.inf
+    best_position = 0.0
+    traversed = 0.0
+    for start, end in zip(polyline, polyline[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length_squared = dx * dx + dy * dy
+        segment_length = math.sqrt(length_squared)
+        if length_squared <= 1e-18:
+            distance = _distance(point, start)
+            ratio = 0.0
+        else:
+            ratio = max(
+                0.0,
+                min(
+                    1.0,
+                    ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
+                    / length_squared,
+                ),
+            )
+            projection = (start[0] + ratio * dx, start[1] + ratio * dy)
+            distance = _distance(point, projection)
+        if distance < best_distance:
+            best_distance = distance
+            best_position = traversed + ratio * segment_length
+        traversed += segment_length
+    return best_distance, best_position
 
 
 def _distance(a: Tuple[float, float], b: Tuple[float, float]) -> float:
@@ -858,46 +983,6 @@ def inventory(feature_set: FeatureSet) -> Dict[str, object]:
         "semantics": dict(feature_set.semantics),
         "coordinate_system": "geographic" if feature_set.geographic else "local_metric",
     }
-
-
-def _write_text_report(path: Path, payload: Dict[str, object]) -> None:
-    lines = [
-        "Vector map roundtrip diagnostic",
-        "=" * 72,
-        f"Case: {payload.get('case', '')}",
-        f"Source: {payload.get('source', '')}",
-        f"Roundtrip target: {payload.get('roundtrip_target', '')}",
-        f"Result: {payload.get('result', 'FAIL')}",
-        "",
-        "Anti-cheat:",
-        f"  {json.dumps(payload.get('anti_cheat', {}), ensure_ascii=False)}",
-        "",
-        "Metrics:",
-    ]
-    for metric in payload.get("metrics", []):
-        lines.append(
-            f"  [{metric.get('status')}] {metric.get('name')}: "
-            f"value={metric.get('value')} required {metric.get('operator')} {metric.get('threshold')}"
-        )
-    lines.extend(["", "Pipeline:"])
-    for stage in payload.get("pipeline", []):
-        lines.append(
-            f"  [{stage.get('status')}] {stage.get('stage')}: {stage.get('detail', '')}"
-        )
-    issues = payload.get("issues", [])
-    lines.extend(["", f"Issues: {len(issues)}"])
-    for issue in issues:
-        lines.append(f"  [{issue.get('status')}] {issue.get('category')}: {issue.get('summary')}")
-    lines.extend(
-        [
-            "",
-            "Visual review:",
-            f"  {json.dumps(payload.get('visual_review', {}), ensure_ascii=False)}",
-        ]
-    )
-    if payload.get("traceback"):
-        lines.extend(["", "Traceback:", str(payload["traceback"]).rstrip()])
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_summary(output_dir: Path, rows: Sequence[Dict[str, object]]) -> Tuple[Path, Path]:

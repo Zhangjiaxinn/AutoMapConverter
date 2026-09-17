@@ -1,4 +1,4 @@
-"""Stable Python API for AutoMapConverter vector-map workflows."""
+"""Stable Python API for AutoMapConverter map-conversion workflows."""
 
 from __future__ import annotations
 
@@ -16,22 +16,22 @@ from ..validation.diagnostics._workflow_runtime import (
     convert_opendrive_to_lanelet2,
     convert_osm_to_lanelet2,
     run_single,
-    validate_lanelet2_target,
-    validate_osm_target,
 )
 from ..validation.diagnostics.source_map_precheck import (
-    prepare_source_for_conversion,
-    repair_target_after_conversion,
+    detect_repairable_source_issues,
+    prepare_source_if_needed,
 )
-from .settings import load_runtime_settings, use_runtime_settings
+from .result_layout import allocate_batch_run, allocate_result_run, write_result_manifest
+from .settings import current_runtime_settings, load_runtime_settings, use_runtime_settings
 
 
 class MapFormat(str, Enum):
-    """Vector map formats supported by the public conversion API."""
+    """Map formats supported by the public conversion API."""
 
     LANELET2 = "lanelet2"
     OPENDRIVE = "opendrive"
     OSM = "osm"
+    RASTER = "raster"
 
 
 PathLike = Union[str, Path]
@@ -39,15 +39,15 @@ PathLike = Union[str, Path]
 
 @dataclass
 class ConversionResult:
-    """Files and normalization records produced by one conversion."""
+    """Files and conversion notes produced by one conversion."""
 
     conversion: str
     source: Path
     target: Path
-    source_precheck: List[Dict[str, str]] = field(default_factory=list)
+    prepared_source: Path | None = None
     conversion_notes: List[Dict[str, str]] = field(default_factory=list)
-    target_repair: List[Dict[str, str]] = field(default_factory=list)
     diagnostics_report: Path | None = None
+    artifacts: Dict[str, Path] = field(default_factory=dict)
 
 
 _CONVERSION_NAMES = {
@@ -57,6 +57,7 @@ _CONVERSION_NAMES = {
     (MapFormat.LANELET2, MapFormat.OSM): "lanelet2_to_osm",
     (MapFormat.OSM, MapFormat.OPENDRIVE): "osm_to_opendrive",
     (MapFormat.OPENDRIVE, MapFormat.OSM): "opendrive_to_osm",
+    (MapFormat.LANELET2, MapFormat.RASTER): "lanelet2_to_raster",
 }
 
 _COMPOSED_CONVERSIONS = {
@@ -66,6 +67,8 @@ _COMPOSED_CONVERSIONS = {
 
 
 def _as_format(value: MapFormat | str) -> MapFormat:
+    if isinstance(value, MapFormat):
+        return value
     try:
         return MapFormat(str(value).lower())
     except ValueError as exc:
@@ -84,19 +87,35 @@ def conversion_name(source_format: MapFormat | str, target_format: MapFormat | s
         raise ValueError(f"Unsupported conversion: {source.value} -> {target.value}.") from exc
 
 
-def _raise_on_failed_precheck(records: Sequence[Dict[str, str]]) -> None:
-    failed = [record for record in records if record.get("status") == "FAIL"]
-    if not failed:
-        return
-    details = "; ".join(
-        f"{record.get('category', 'source-precheck')}: {record.get('summary', '')}"
-        for record in failed[:3]
-    )
-    raise ValueError(f"Source map precheck failed: {details}")
-
-
 def _intermediate_lanelet_path(source_path: Path, target_path: Path) -> Path:
     return target_path.parent / "intermediate_lanelet2" / f"{source_path.stem}.osm"
+
+
+def _prepared_source_path(source_path: Path, target_path: Path) -> Path:
+    """Return the run-local source-copy path used only when repair changes it."""
+    candidate = target_path.parent / f"{source_path.stem}_prepared{source_path.suffix}"
+    if candidate.resolve() == source_path.resolve():
+        return target_path.parent / f"{source_path.stem}_prepared_input{source_path.suffix}"
+    return candidate
+
+
+def _prepare_source_for_direct_conversion(
+    conversion: str,
+    source_path: Path,
+    target_path: Path,
+) -> tuple[Path, Path | None, List[Dict[str, str]]]:
+    """Create a prepared copy only after a read-only repair scan finds an issue."""
+    repair_candidates = detect_repairable_source_issues(conversion, source_path)
+    if not repair_candidates:
+        return source_path, None, []
+
+    prepared_path, repair_notes = prepare_source_if_needed(
+        conversion,
+        source_path,
+        _prepared_source_path(source_path, target_path),
+    )
+    prepared_source = prepared_path if prepared_path != source_path else None
+    return prepared_source or source_path, prepared_source, repair_candidates + repair_notes
 
 
 def _convert_atomic(
@@ -123,6 +142,20 @@ def _convert_atomic(
     if conversion == "lanelet2_to_osm":
         convert_lanelet2_to_osm(source_path, target_path, intermediate_dir)
         return []
+    if conversion == "lanelet2_to_raster":
+        from ..conversion.lanelet2_to_raster import convert_lanelet2_to_raster
+
+        settings = current_runtime_settings()
+        convert_lanelet2_to_raster(
+            source_path,
+            target_path,
+            resolution_m=settings.raster_resolution_m,
+            padding_m=settings.raster_padding_m,
+            supersampling=settings.raster_supersampling,
+            topology_tolerance_m=settings.raster_topology_tolerance_m,
+            max_output_pixels=settings.raster_max_output_pixels,
+        )
+        return []
     raise ValueError(f"Unhandled atomic conversion {conversion!r}.")
 
 
@@ -134,32 +167,20 @@ def _convert_without_diagnostics(
     extract_sublayer: bool,
 ) -> ConversionResult:
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    prepared_source, source_precheck = prepare_source_for_conversion(
-        conversion,
-        source_path,
-        target_path.parent / "preprocessed_sources",
-    )
-    _raise_on_failed_precheck(source_precheck)
 
     notes: List[Dict[str, str]] = []
     if conversion in _COMPOSED_CONVERSIONS:
         first, second = _COMPOSED_CONVERSIONS[conversion]
-        intermediate_path = _intermediate_lanelet_path(prepared_source, target_path)
+        intermediate_path = _intermediate_lanelet_path(source_path, target_path)
         intermediate_path.parent.mkdir(parents=True, exist_ok=True)
         notes.extend(
             _convert_atomic(
                 first,
-                prepared_source,
+                source_path,
                 intermediate_path,
                 extract_sublayer=extract_sublayer,
             )
         )
-        intermediate_repair = repair_target_after_conversion(
-            first,
-            intermediate_path,
-            intermediate_path.parent / "target_repairs",
-        )
-        notes.extend({**record, "category": f"intermediate-{record['category']}"} for record in intermediate_repair)
         notes.extend(
             _convert_atomic(
                 second,
@@ -171,23 +192,22 @@ def _convert_without_diagnostics(
     else:
         notes = _convert_atomic(
             conversion,
-            prepared_source,
+            source_path,
             target_path,
             extract_sublayer=extract_sublayer,
         )
 
-    target_repair = repair_target_after_conversion(
-        conversion,
-        target_path,
-        target_path.parent / "target_repairs",
-    )
+    artifacts: Dict[str, Path] = {}
+    if conversion == "lanelet2_to_raster":
+        from ..conversion.lanelet2_to_raster import raster_artifact_paths
+
+        artifacts = raster_artifact_paths(target_path).as_dict()
     return ConversionResult(
         conversion=conversion,
         source=source_path,
         target=target_path,
-        source_precheck=source_precheck,
         conversion_notes=notes,
-        target_repair=target_repair,
+        artifacts=artifacts,
     )
 
 
@@ -210,12 +230,21 @@ def _convert(
     target_path = Path(target).expanduser().resolve()
     if not source_path.is_file():
         raise FileNotFoundError(f"Source map does not exist: {source_path}")
-    return _convert_without_diagnostics(
+    effective_source, prepared_source, repair_notes = _prepare_source_for_direct_conversion(
         conversion,
         source_path,
         target_path,
+    )
+    result = _convert_without_diagnostics(
+        conversion,
+        effective_source,
+        target_path,
         extract_sublayer=extract_sublayer,
     )
+    result.source = source_path
+    result.prepared_source = prepared_source
+    result.conversion_notes = repair_notes + result.conversion_notes
+    return result
 
 
 def convert(
@@ -264,6 +293,8 @@ def _spec_for(conversion: str, source_path: Path, target_path: Path) -> Conversi
         from ..validation.diagnostics.osm_lanelet2_diagnostics import create_spec
     elif conversion == "lanelet2_to_osm":
         from ..validation.diagnostics.lanelet2_osm_diagnostics import create_spec
+    elif conversion == "lanelet2_to_raster":
+        from ..validation.diagnostics.lanelet2_raster_diagnostics import create_spec
     else:
         raise ValueError(f"No direct diagnostic profile exists for {conversion!r}.")
     return create_spec(source_path, target_path)
@@ -291,8 +322,8 @@ def _write_composed_report(
                 "conversion": payload.get("conversion", "unknown"),
                 "result": payload.get("result", "UNKNOWN"),
                 "summary": payload.get("summary", {}),
-                "report_txt": str(report_path),
-                "report_json": str(report_path.with_suffix(".json")),
+                "report": str(report_path),
+                "prepared_source": payload.get("prepared_source", ""),
             }
         )
     result = (
@@ -307,23 +338,17 @@ def _write_composed_report(
         "conversion": conversion,
         "source": str(source_path),
         "target": str(target_path),
+        "prepared_source": next(
+            (stage["prepared_source"] for stage in stages if stage["prepared_source"]),
+            "",
+        ),
         "result": result,
         "stages": stages,
     }
     stem = f"{target_path.stem}_{conversion}_diagnostics"
     json_path = diagnostics_dir / f"{stem}.json"
-    txt_path = diagnostics_dir / f"{stem}.txt"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    lines = [f"{conversion} composed diagnostics", "=" * 72, f"Result: {result}", ""]
-    for index, stage in enumerate(stages, start=1):
-        lines.extend(
-            [
-                f"Stage {index}: {stage['conversion']} -> {stage['result']}",
-                f"  report: {stage['report_txt']}",
-            ]
-        )
-    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return txt_path
+    return json_path
 
 
 def _diagnose_composed(
@@ -389,13 +414,26 @@ def _convert_and_diagnose(
             diagnose_lanelet2_to_opendrive,
         )
 
-        result = _convert_without_diagnostics(
+        effective_source, prepared_source, repair_notes = _prepare_source_for_direct_conversion(
             conversion,
             source_path,
             target_path,
+        )
+        result = _convert_without_diagnostics(
+            conversion,
+            effective_source,
+            target_path,
             extract_sublayer=True,
         )
-        result.diagnostics_report = diagnose_lanelet2_to_opendrive(source_path, target_path)
+        result.source = source_path
+        result.prepared_source = prepared_source
+        result.conversion_notes = repair_notes + result.conversion_notes
+        result.diagnostics_report = diagnose_lanelet2_to_opendrive(
+            effective_source,
+            target_path,
+            original_source_path=source_path,
+            source_preparation=repair_notes,
+        )
         return result
     report_path = run_single(
         _spec_for(conversion, source_path, target_path),
@@ -403,11 +441,17 @@ def _convert_and_diagnose(
         target_path,
         report_dir,
     )
+    artifacts: Dict[str, Path] = {}
+    if conversion == "lanelet2_to_raster":
+        from ..conversion.lanelet2_to_raster import raster_artifact_paths
+
+        artifacts = raster_artifact_paths(target_path).as_dict()
     return ConversionResult(
         conversion=conversion,
         source=source_path,
         target=target_path,
         diagnostics_report=report_path,
+        artifacts=artifacts,
     )
 
 
@@ -443,7 +487,7 @@ def convert_batch_and_diagnose(
     limit: int | None = None,
     config_path: PathLike | None = None,
 ) -> Path:
-    """Run one composed conversion route for every compatible map in a directory."""
+    """Run one conversion route for every compatible map in a directory."""
 
     source_kind = _as_format(source_format)
     target_kind = _as_format(target_format)
@@ -451,21 +495,27 @@ def convert_batch_and_diagnose(
     source_root = Path(source_dir).expanduser().resolve()
     destination_root = Path(output_dir).expanduser().resolve()
     suffix = ".xodr" if source_kind is MapFormat.OPENDRIVE else ".osm"
-    target_suffix = ".xodr" if target_kind is MapFormat.OPENDRIVE else ".osm"
+    target_suffix = (
+        ".xodr"
+        if target_kind is MapFormat.OPENDRIVE
+        else ".tif" if target_kind is MapFormat.RASTER else ".osm"
+    )
     sources = sorted(source_root.glob(f"*{suffix}"))
     if limit is not None:
         sources = sources[:limit]
     if not sources:
         raise FileNotFoundError(f"No {suffix} files found in {source_root}")
 
-    batch_dir = destination_root / (run_name or time.strftime("%Y%m%d_%H%M%S"))
-    maps_dir = batch_dir / "output"
-    diagnostics_root = batch_dir / "diagnostics"
-    maps_dir.mkdir(parents=True, exist_ok=True)
-    diagnostics_root.mkdir(parents=True, exist_ok=True)
+    batch_dir = allocate_batch_run(destination_root, conversion, run_name)
     rows = []
     for index, source_path in enumerate(sources, start=1):
-        target_path = maps_dir / f"{source_path.stem}{target_suffix}"
+        result_run = allocate_result_run(
+            destination_root,
+            conversion,
+            source_path,
+            target_suffix,
+        )
+        target_path = result_run.target
         print(f"[{index}/{len(sources)}] {conversion}: {source_path.name}")
         started = time.time()
         try:
@@ -474,24 +524,38 @@ def convert_batch_and_diagnose(
                 target_path,
                 source_kind,
                 target_kind,
-                diagnostics_dir=diagnostics_root / source_path.stem,
+                diagnostics_dir=result_run.directory,
                 config_path=config_path,
             )
             report_payload = _load_report_payload(result.diagnostics_report)
+            elapsed = time.time() - started
+            write_result_manifest(
+                result_run,
+                result.diagnostics_report,
+                elapsed_seconds=elapsed,
+                result=str(report_payload.get("result", "UNKNOWN")),
+            )
             row = {
                 "map": source_path.name,
                 "target": str(target_path),
                 "result": report_payload.get("result", "UNKNOWN"),
                 "diagnostics": str(result.diagnostics_report),
-                "elapsed_seconds": round(time.time() - started, 3),
+                "elapsed_seconds": round(elapsed, 3),
             }
         except Exception as exc:
+            elapsed = time.time() - started
+            write_result_manifest(
+                result_run,
+                None,
+                elapsed_seconds=elapsed,
+                result="FAIL",
+            )
             row = {
                 "map": source_path.name,
                 "target": str(target_path),
                 "result": "FAIL",
                 "error": f"{type(exc).__name__}: {exc}",
-                "elapsed_seconds": round(time.time() - started, 3),
+                "elapsed_seconds": round(elapsed, 3),
             }
         rows.append(row)
 

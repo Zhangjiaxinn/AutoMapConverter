@@ -109,80 +109,37 @@ class Lanelet2Parser:
         for reg_element_rel in self.xml.xpath(
             "//relation/tag[@v='regulatory_element' and @k='type']/.."
         ):
-            # returns the parent element if there is another tag inside that is the right of way tag
-            for right_of_way_rel in reg_element_rel.xpath(
-                "./tag[@v='right_of_way' and @k='subtype']/.."
-            ):
-                try:
-                    yield_lanelets = right_of_way_rel.xpath("./member[@role='yield']/@ref")
-                    right_of_way_lanelets = right_of_way_rel.xpath(
-                        "./member[@role='right_of_way']/@ref"
-                    )
-                    traffic_signs = right_of_way_rel.xpath("./member[@role='refers']/@ref")
-                    # Reference line is optional
-                    # defaults to last line of yield lanelets
-                    tag_dict = {
-                        tag.get("k"): tag.get("v")
-                        for tag in right_of_way_rel.xpath("./tag[@k and @v]")
-                    }
-                    ref_lines = right_of_way_rel.xpath("./member[@role='ref_line']/@ref")
-                    osm.add_regulatory_element(
-                        RegulatoryElement(
-                            right_of_way_rel.get("id"),
-                            traffic_signs,
-                            yield_lanelets,
-                            right_of_way_lanelets,
-                            tag_dict,
-                            ref_lines,
-                        )
-                    )
-                except IndexError:
-                    print(
-                        f"Right of way relation {right_of_way_rel.attrib.get('id')} has no traffic sign. "
-                        f"Please check your data! Discarding."
-                    )
+            reg_id = reg_element_rel.get("id")
+            if not reg_id:
+                continue
+            tags = {
+                tag.get("k"): tag.get("v")
+                for tag in reg_element_rel.xpath("./tag[@k and @v]")
+            }
+            members = reg_element_rel.findall("member")
 
-            for speed_limit in reg_element_rel.xpath("./tag[@v='speed_limit' and @k='subtype']/.."):
-                speed_limit_id = speed_limit.attrib["id"]
-                refers = speed_limit.xpath("./member[@role='refers']/@ref")
-                ref_lines = speed_limit.xpath("./member[@role='ref_line']/@ref")
-                tag_dict = {
-                    tag.get("k"): tag.get("v")
-                    for tag in speed_limit.xpath("./tag[@k and @v]")
-                }
-                osm.add_regulatory_element(
-                    RegulatoryElement(
-                        speed_limit_id,
-                        refers=refers,
-                        ref_line=ref_lines,
-                        tag_dict=tag_dict,
-                    )
+            def references(role):
+                return [
+                    member.get("ref")
+                    for member in members
+                    if member.get("role") == role and member.get("ref")
+                ]
+
+            osm.add_regulatory_element(
+                RegulatoryElement(
+                    reg_id,
+                    refers=references("refers"),
+                    yield_ways=references("yield"),
+                    right_of_ways=references("right_of_way"),
+                    tag_dict=tags,
+                    ref_line=references("ref_line"),
                 )
-                speeds = speed_limit.xpath("./tag[@k='sign_type']/@v")
-                if speeds:
-                    osm.add_speed_limit_sign(
-                        speed_limit_id,
-                        speeds[0],
-                        TrafficSignIDGermany.MAX_SPEED,
-                    )
-
-            for traffic_light in reg_element_rel.xpath(
-                "./tag[@v='traffic_light' and @k='subtype']/.."
-            ):
-                traffic_lights = traffic_light.xpath("./member[@role='refers']/@ref")
-                ref_lines = traffic_light.xpath("./member[@role='ref_line']/@ref")
-                tag_dict = {
-                    tag.get("k"): tag.get("v")
-                    for tag in traffic_light.xpath("./tag[@k and @v]")
-                }
-
-                osm.add_regulatory_element(
-                    RegulatoryElement(
-                        traffic_light.get("id"),
-                        ref_line=ref_lines,
-                        refers=traffic_lights,
-                        tag_dict=tag_dict,
-                    )
+            )
+            if tags.get("subtype") == "speed_limit" and tags.get("sign_type"):
+                osm.add_speed_limit_sign(
+                    reg_id,
+                    tags["sign_type"],
+                    TrafficSignIDGermany.MAX_SPEED,
                 )
 
         return osm

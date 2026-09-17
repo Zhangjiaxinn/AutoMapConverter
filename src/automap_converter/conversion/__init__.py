@@ -1,1 +1,1 @@
-"""Four self-contained vector-map conversion workflows."""
+"""Atomic vector and raster map-conversion stages."""

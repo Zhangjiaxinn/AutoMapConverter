@@ -5,6 +5,8 @@ nav:
   - Home: index.md
   - Architecture: architecture.md
   - Conversion Workflows: conversion_workflows.md
+  - Lanelet2 Raster: lanelet2_raster.md
+  - OnSite Showcase: onsite_map_conversion_showcase.md
   - Conversion Rules: conversion_rules.md
   - Python API: api.md
   - CLI: cli.md

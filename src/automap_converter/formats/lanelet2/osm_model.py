@@ -1,5 +1,16 @@
 from typing import Dict, List, Optional, Union
+
 from lxml import etree  # type: ignore
+
+
+def _osm_id_sort_key(raw_id: str):
+    """Match osmium ordering: temporary negative ids precede positive ids."""
+
+    try:
+        value = int(raw_id)
+        return (0, abs(value)) if value < 0 else (1, value)
+    except (TypeError, ValueError):
+        return 2, str(raw_id)
 
 
 class Taggable:
@@ -257,14 +268,14 @@ class OSM:
         osm.set("version", "0.6")
         osm.set("generator", "custom-python-osm")
 
-        for node in self.nodes.values():
-            osm.append(node.serialize_to_xml())
+        for node_id in sorted(self.nodes, key=_osm_id_sort_key):
+            osm.append(self.nodes[node_id].serialize_to_xml())
 
-        for way in self.ways.values():
-            osm.append(way.serialize_to_xml())
+        for way_id in sorted(self.ways, key=_osm_id_sort_key):
+            osm.append(self.ways[way_id].serialize_to_xml())
 
-        for relation in self.relations.values():
-            osm.append(relation.serialize_to_xml())
+        for relation_id in sorted(self.relations, key=_osm_id_sort_key):
+            osm.append(self.relations[relation_id].serialize_to_xml())
 
         return osm
 
