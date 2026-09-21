@@ -4335,6 +4335,8 @@ class Lanelet2OpendriveConverter:
 
             source_subtype = self._multipolygon_source_subtype(mp)
             object_type = self._map_multipolygon_to_object_type(source_subtype)
+            if object_type == "none":
+                continue
             simple_types = {
                 str(value) for value in self.config.lanelet2_simple_object_types
             }
