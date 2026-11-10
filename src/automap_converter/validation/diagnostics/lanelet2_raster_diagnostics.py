@@ -363,6 +363,8 @@ def diagnose_lanelet2_to_raster(
             "element_mapping": [item for item in checks if item["stage"] == "element_mapping"],
         },
     }
+    from .raster_oneway import evaluate_raster_oneway
+    payload["oneway_quantitative_proposal"] = evaluate_raster_oneway(source, artifacts.semantic)
     report_path = output_dir / f"{target.stem}_diagnostics.json"
     report_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

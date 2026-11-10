@@ -103,6 +103,12 @@ def test_roundtrip_features_follow_reversed_shared_boundary(tmp_path):
         encoding="utf-8",
     )
 
+    # This fixture is local engineering geometry, not a ten-degree-wide road.
+    tree = etree.parse(str(source))
+    for node in tree.getroot().findall("node"):
+        etree.SubElement(node, "tag", k="local_x", v=node.get("lon"))
+        etree.SubElement(node, "tag", k="local_y", v=node.get("lat"))
+    tree.write(str(source))
     features = _extract_lanelet2(source).features
     positive = next(feature for feature in features if feature.key == "positive_lane")
 

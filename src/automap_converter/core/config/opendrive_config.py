@@ -70,6 +70,8 @@ class OpenDriveConfig(BaseConfig):
     filter_types = Attribute(
         [
             "driving",
+            "biking",
+            "bus",
             "restricted",
             "onRamp",
             "offRamp",
@@ -77,6 +79,7 @@ class OpenDriveConfig(BaseConfig):
             "entry",
             "sidewalk",
             "shoulder",
+            "border",
             "crosswalk",
             "bidirectional",
         ],

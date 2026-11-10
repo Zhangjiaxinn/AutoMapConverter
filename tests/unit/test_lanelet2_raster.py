@@ -66,3 +66,21 @@ def test_lanelet2_raster_products_and_diagnostics(tmp_path: Path) -> None:
     report = json.loads(result.diagnostics_report.read_text(encoding="utf-8"))
     assert report["result"] == "PASS"
     assert report["metrics"]["relation_coverage"] == 1.0
+
+
+def test_oneway_quantification_reads_actual_pixels_not_only_metadata(tmp_path):
+    from automap_converter.conversion.lanelet2_to_raster import convert_lanelet2_to_raster
+    from automap_converter.validation.diagnostics.raster_oneway import evaluate_raster_oneway
+    source, target = tmp_path / "lanes.osm", tmp_path / "lanes.tif"
+    source.write_text(LANELET2_FIXTURE)
+    convert_lanelet2_to_raster(source, target, resolution_m=.1)
+    result = evaluate_raster_oneway(source, target)
+    assert result["result"] == "PASS"
+    with rasterio.open(target, "r+") as dataset:
+        band = dataset.read(1)
+        band[:] = 0
+        dataset.write(band, 1)
+    corrupted = evaluate_raster_oneway(source, target)
+    assert corrupted["result"] == "FAIL"
+    assert corrupted["metrics"][0]["value"] == 0
+    assert corrupted["metrics"][1]["passed"] == 0

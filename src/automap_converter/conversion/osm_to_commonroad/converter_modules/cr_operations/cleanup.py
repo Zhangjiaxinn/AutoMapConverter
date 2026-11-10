@@ -675,6 +675,8 @@ def create_lanelet(
         traffic_signs=traffic_signs,
         traffic_lights=traffic_lights,
     )
+    new_lanelet.osm_source_way_ids = set(getattr(lanelet, "osm_source_way_ids", set()))
+    new_lanelet.osm_road_model = dict(getattr(lanelet, "osm_road_model", {}))
     return new_lanelet
 
 

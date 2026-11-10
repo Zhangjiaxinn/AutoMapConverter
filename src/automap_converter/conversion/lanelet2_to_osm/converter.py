@@ -289,7 +289,8 @@ class Lanelet2OSMConverter:
             only_fill_missing=self.fallback_fill_missing_topology_only,
         )
 
-        self._convert_lanelets_to_road_centerlines()
+        from .native_roads import export_native_roads
+        export_native_roads(self)
         self._convert_selected_multipolygon_features()
         return self._out
     
@@ -1103,6 +1104,13 @@ class Lanelet2OSMConverter:
 
     def _xy_to_latlon_if_needed(self, xy: Tuple[float, float]) -> Tuple[float, float]:
         """Convert local metric XY back to lat/lon for newly generated auxiliary features."""
+        frame = getattr(self._source, "coordinate_frame", {})
+        if frame.get("kind") in {"engineering", "projected"}:
+            from pyproj import Transformer
+            from automap_converter.core.config.general_config import general_config
+            crs = frame.get("crs") or frame.get("encoding_crs") or general_config.proj_string_cr
+            lon, lat = Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform(*xy)
+            return lat, lon
         if self._xy_origin_lat is None or self._xy_origin_lon is None:
             self._xy_origin_lat = 0.0
             self._xy_origin_lon = 0.0
@@ -4642,6 +4650,19 @@ class Lanelet2OSMConverter:
         tags: Dict[str, str] = {
             "lanes": str(len(lanelet_group)),
         }
+        widths = []
+        for lane in lanelet_group:
+            pair = []
+            for wid in (lane.left_way, lane.right_way):
+                way = self._source.find_way_by_id(str(wid))
+                pair.append([self._node_xy(self._source.nodes[str(n)]) for n in way.nodes])
+            if all(len(p) >= 2 for p in pair):
+                from shapely.geometry import LineString
+                widths.append(LineString(pair[0]).interpolate(.5, normalized=True).distance(
+                    LineString(pair[1]).interpolate(.5, normalized=True)))
+        if len(widths) == len(lanelet_group):
+            tags["width"] = f"{sum(widths):.5f}"
+            tags["width:lanes"] = "|".join(f"{w:.5f}" for w in widths)
         if self.add_default_highway_tag:
             tags["highway"] = "road"
 

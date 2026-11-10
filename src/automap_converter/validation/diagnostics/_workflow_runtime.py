@@ -36,6 +36,7 @@ from automap_converter.api.interface import (  # noqa: E402
     osm_to_commonroad,
 )
 from automap_converter.api.settings import current_runtime_settings  # noqa: E402
+from automap_converter.core.traceability import annotate_conversion  # noqa: E402
 from automap_converter.api.result_layout import (  # noqa: E402
     allocate_batch_run,
     allocate_result_run,
@@ -438,6 +439,19 @@ def _non_pass_records(
 
 
 def convert_opendrive_to_lanelet2(source_path: Path, target_path: Path, _: Path) -> None:
+    from automap_converter.core.traceability import read_frame, parse_xml, document_id
+    frame = read_frame(parse_xml(source_path).getroot(), "opendrive", fallback_id=document_id(source_path))
+    old_projection, old_general = open_drive_config.proj_string_odr, general_config.proj_string_cr
+    if frame.get("kind") == "projected":
+        open_drive_config.proj_string_odr = frame["crs"]
+        general_config.proj_string_cr = frame["crs"]
+    try:
+        _convert_opendrive_to_lanelet2(source_path, target_path)
+    finally:
+        open_drive_config.proj_string_odr, general_config.proj_string_cr = old_projection, old_general
+
+
+def _convert_opendrive_to_lanelet2(source_path, target_path):
     target_path.parent.mkdir(parents=True, exist_ok=True)
     lanelet2_config.autoware = False
     lanelet2_config.use_local_coordinates = True
@@ -448,6 +462,15 @@ def convert_opendrive_to_lanelet2(source_path: Path, target_path: Path, _: Path)
         general_conf=general_config,
         lanelet_conf=lanelet2_config,
     )
+    from automap_converter.conversion.opendrive_to_commonroad.native_boundaries import (
+        materialize_boundaries,
+    )
+
+    geometry_audit = materialize_boundaries(source_path, target_path, general_config.proj_string_cr)
+    target_path.with_name(target_path.stem + "_native_geometry_audit.json").write_text(
+        json.dumps(geometry_audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    annotate_conversion(source_path, target_path, "opendrive", "lanelet2")
 
 
 def convert_lanelet2_to_opendrive(source_path: Path, target_path: Path, _: Path) -> None:
@@ -461,6 +484,7 @@ def convert_lanelet2_to_opendrive(source_path: Path, target_path: Path, _: Path)
         opendrive_conf=open_drive_config,
         enrich_topology=current_runtime_settings().lanelet2_routing_enrichment,
     )
+    annotate_conversion(source_path, target_path, "lanelet2", "opendrive")
 
 
 def convert_osm_to_lanelet2(
@@ -469,8 +493,36 @@ def convert_osm_to_lanelet2(
     intermediate_dir: Path,
     extract_sublayer: bool = True,
 ) -> List[Dict[str, str]]:
+    from automap_converter.core.traceability import read_frame, document_id
+    from pyproj import CRS
+    root = etree.parse(str(source_path)).getroot()
+    frame = read_frame(root, "osm", fallback_id=document_id(source_path))
+    old_projection = general_config.proj_string_cr
+    # Web Mercator metres are not ground metres for lane-width expansion.
+    if frame.get("engineering_frame"):
+        projection = frame["encoding_crs"]
+    elif root.find("node") is not None:
+        node = root.find("node")
+        lon, lat = float(node.get("lon")), float(node.get("lat"))
+        zone = min(60, max(1, int((lon + 180) / 6) + 1))
+        projection = CRS.from_epsg((32600 if lat >= 0 else 32700) + zone).to_string()
+    else:
+        projection = old_projection
+    general_config.proj_string_cr = projection
+    try:
+        return _convert_osm_to_lanelet2(source_path, target_path, intermediate_dir, extract_sublayer)
+    finally:
+        general_config.proj_string_cr = old_projection
+
+
+def _convert_osm_to_lanelet2(source_path, target_path, intermediate_dir, extract_sublayer):
     target_path.parent.mkdir(parents=True, exist_ok=True)
     intermediate_dir.mkdir(parents=True, exist_ok=True)
+    from automap_converter.formats.osm.lanelet_profile import read_detail_layer
+
+    if read_detail_layer(source_path, target_path, general_config.proj_string_cr):
+        annotate_conversion(source_path, target_path, "osm", "lanelet2")
+        return [{"category": "osm-detail-profile", "status": "PASS", "summary": "Read declared lanelet2-v1 native nodes/ways/lanelets/rules; provenance was not used for reconstruction."}]
     old_extract_sublayer = osm_config.EXTRACT_SUBLAYER
     old_main_highways = dict(osm_config.ACCEPTED_HIGHWAYS_MAINLAYER)
     configured_sublayer = {
@@ -496,9 +548,22 @@ def convert_osm_to_lanelet2(
     accepted_main_highways["unclassified"] = True
     osm_config.EXTRACT_SUBLAYER = effective_extract_sublayer
     osm_config.ACCEPTED_HIGHWAYS_MAINLAYER = accepted_main_highways
+    extent_settings = {
+        key: getattr(osm_config, key)
+        for key in (
+            "INTERSECTION_DISTANCE", "INTERSECTION_DISTANCE_SUBLAYER",
+            "INTERSECTION_CROPPING_WITH_RESPECT_TO_ROADS", "MERGE_DISTANCE",
+        )
+    }
+    osm_config.INTERSECTION_DISTANCE = 0.0
+    osm_config.INTERSECTION_DISTANCE_SUBLAYER = 0.0
+    osm_config.INTERSECTION_CROPPING_WITH_RESPECT_TO_ROADS = False
+    osm_config.MERGE_DISTANCE = 0.0
     try:
         scenario = osm_to_commonroad(str(source_path))
     finally:
+        for key, value in extent_settings.items():
+            setattr(osm_config, key, value)
         osm_config.EXTRACT_SUBLAYER = old_extract_sublayer
         osm_config.ACCEPTED_HIGHWAYS_MAINLAYER = old_main_highways
     commonroad_path = intermediate_dir / f"{source_path.stem}.xml"
@@ -513,7 +578,25 @@ def convert_osm_to_lanelet2(
     writer.write_to_file(str(commonroad_path), OverwriteExistingFile.ALWAYS)
     lanelet2_config.autoware = False
     lanelet2_config.use_local_coordinates = True
-    commonroad_to_lanelet(str(commonroad_path), str(target_path), lanelet_conf=lanelet2_config)
+    # Retain the original XML roundtrip and its geometry. Restore only source
+    # identity fields, which CommonRoad XML cannot serialize.
+    source_ids = {
+        str(l.lanelet_id): set(getattr(l, "osm_source_way_ids", set()))
+        for l in scenario.lanelet_network.lanelets
+    }
+    commonroad_to_lanelet(
+        str(commonroad_path), str(target_path), lanelet_conf=lanelet2_config,
+        osm_source_way_ids=source_ids,
+        osm_road_models={
+            str(l.lanelet_id): getattr(l, "osm_road_model", {})
+            for l in scenario.lanelet_network.lanelets
+        },
+    )
+    from automap_converter.conversion.osm_to_commonroad.road_completion import complete_nonmotor_roads
+    complete_nonmotor_roads(source_path, target_path, general_config.proj_string_cr)
+    from automap_converter.conversion.osm_to_commonroad.native_rules import apply_lane_rules
+    apply_lane_rules(source_path, target_path)
+    annotate_conversion(source_path, target_path, "osm", "lanelet2")
     records = [
         {
             "category": "osm-sublayer",
@@ -546,6 +629,10 @@ def convert_lanelet2_to_osm(source_path: Path, target_path: Path, _: Path) -> No
         enrich_topology=current_runtime_settings().lanelet2_routing_enrichment,
     )
     osm_out.write_xml(target_path)
+    if current_runtime_settings().osm_profile == "lanelet2-v1":
+        from automap_converter.formats.osm.lanelet_profile import append_detail_layer
+        append_detail_layer(source_path, target_path, general_config.proj_string_cr)
+    annotate_conversion(source_path, target_path, "lanelet2", "osm")
 
 
 @dataclass

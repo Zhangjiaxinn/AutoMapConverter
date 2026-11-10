@@ -229,7 +229,7 @@ class GraphEdge:
 
         :return: width
         """
-        return self.nr_of_lanes * config.LANEWIDTHS[self.roadtype]
+        return self.nr_of_lanes * self.lanewidth
 
     def generate_lanes(self) -> None:
         """

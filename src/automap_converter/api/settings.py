@@ -20,6 +20,7 @@ class RuntimeSettings:
 
     lanelet2_routing_enrichment: bool = True
     osm_extract_sublayer: bool = True
+    osm_profile: str = "public"
     opendrive_version: str = "1.6.1"
     raster_resolution_m: float = 0.5
     raster_padding_m: float = 5.0
@@ -120,11 +121,15 @@ def load_runtime_settings(config_path: str | Path | None = None) -> RuntimeSetti
     raster = _mapping(root.get("raster"), "raster")
     stage1 = _mapping(root.get("stage1"), "stage1")
     diagnostics = _mapping(root.get("diagnostics"), "diagnostics")
+    osm_profile = conversion.get("osm_profile", "public")
+    if not isinstance(osm_profile, str) or osm_profile not in {"public", "lanelet2-v1"}:
+        raise ValueError("conversion.osm_profile must be 'public' or 'lanelet2-v1'.")
     return RuntimeSettings(
         lanelet2_routing_enrichment=_bool(
             conversion, "lanelet2_routing_enrichment", True
         ),
         osm_extract_sublayer=_bool(conversion, "osm_extract_sublayer", True),
+        osm_profile=osm_profile,
         opendrive_version=_version(conversion.get("opendrive_version", "1.6.1")),
         raster_resolution_m=_float(raster, "resolution_m", 0.5, minimum=0.01),
         raster_padding_m=_float(raster, "padding_m", 5.0, minimum=0.0),

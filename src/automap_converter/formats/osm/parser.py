@@ -244,6 +244,7 @@ def parse_restrictions(restrictions: Set[ElTree.Element]) -> RestrictionDict:
                 via_element_type = member.attrib["type"]
 
         if None not in [from_edge_id, to_edge_id, via_element_id, via_element_type]:
+            from_edge_id, via_element_id, to_edge_id = map(int,(from_edge_id, via_element_id, to_edge_id))
             restriction_object = Restriction(
                 from_edge_id, via_element_id, via_element_type, to_edge_id, restriction
             )
@@ -449,7 +450,7 @@ def extract_speedlimit(value) -> Tuple[float, bool]:
             pass
         elif value.endswith("mph"):
             try:
-                speedlimit = int(float(value[:-3]) / 1.60934)
+                speedlimit = float(value[:-3]) * 1.609344
             except ValueError:
                 logging.error("unreadable speedlimit: '{}'".format(value))
         elif value in config.SPEED_LIMITS:
@@ -490,7 +491,7 @@ def extract_tag_info(road: ElTree.Element) -> Tuple[Road_info, int]:
         if tag.attrib["k"] == "maxspeed":
             speedlimit, virtual = extract_speedlimit(tag.attrib["v"])
         if tag.attrib["k"] == "oneway":
-            oneway = tag.attrib["v"] == "yes"
+            oneway = tag.attrib["v"] in {"yes", "true", "1", "-1"}
         if tag.attrib["k"] == "junction":
             if oneway is None:
                 if tag.attrib["v"] == "roundabout":
@@ -707,6 +708,9 @@ def get_graph_edges_from_road(
                 # point is not added
                 pass
 
+        native_tags = {t.get("k"): t.get("v") for t in road.findall("tag")}
+        if native_tags.get("oneway") == "-1":
+            flip = not flip
         if flip:
             waypoints.reverse()
 
@@ -748,6 +752,16 @@ def get_graph_edges_from_road(
                     speedlimit,
                     roadtype,
                 )
+                new_edge.osm_source_way_ids = {str(osm_id)}
+                from automap_converter.formats.osm.road_semantics import road_profile
+                native_tags = {t.get("k"): t.get("v") for t in road.findall("tag")}
+                new_edge.osm_road_model = {**road_profile(native_tags), "road_id": str(osm_id),
+                                          "edge_id": str(edge_id), "segment_index": index,
+                                          "reversed": bool(flip),
+                                          "tags": {k: v for k, v in native_tags.items() if k in {
+                                              "highway", "name", "ref", "layer", "bridge", "tunnel",
+                                              "turn:lanes", "turn:lanes:forward", "turn:lanes:backward"}}}
+                new_edge.lanewidth = new_edge.osm_road_model["width_m"] / new_edge.nr_of_lanes
                 new_edges.append(new_edge)
                 edges[osm_id].add(new_edge)
 
@@ -756,6 +770,8 @@ def get_graph_edges_from_road(
                 node2.edges.add(new_edge)
 
                 new_edge.generate_lanes()
+                for lane_index, lane in enumerate(new_edge.lanes):
+                    lane.width1 = lane.width2 = new_edge.osm_road_model["lane_widths_m"][lane_index % new_edge.osm_road_model["lanes"]]
             else:
                 logging.warning("a small edge occurred in the map, it is omitted")
 

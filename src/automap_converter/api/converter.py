@@ -197,7 +197,8 @@ def _convert_without_diagnostics(
             extract_sublayer=extract_sublayer,
         )
 
-    artifacts: Dict[str, Path] = {}
+    audit_path = target_path.with_name(target_path.stem + "_conversion_audit.json")
+    artifacts: Dict[str, Path] = {"conversion_audit": audit_path} if audit_path.is_file() else {}
     if conversion == "lanelet2_to_raster":
         from ..conversion.lanelet2_to_raster import raster_artifact_paths
 
@@ -401,7 +402,7 @@ def _convert_and_diagnose(
         else target_path.parent / "diagnostics"
     )
     if conversion in _COMPOSED_CONVERSIONS:
-        return ConversionResult(
+        result = ConversionResult(
             conversion=conversion,
             source=source_path,
             target=target_path,
@@ -409,6 +410,10 @@ def _convert_and_diagnose(
                 conversion, source_path, target_path, report_dir
             ),
         )
+        audit_path = target_path.with_name(target_path.stem + "_conversion_audit.json")
+        if audit_path.is_file():
+            result.artifacts["conversion_audit"] = audit_path
+        return result
     if conversion == "lanelet2_to_opendrive":
         from ..validation.diagnostics.lanelet2_opendrive_diagnostics import (
             diagnose_lanelet2_to_opendrive,
@@ -441,7 +446,8 @@ def _convert_and_diagnose(
         target_path,
         report_dir,
     )
-    artifacts: Dict[str, Path] = {}
+    audit_path = target_path.with_name(target_path.stem + "_conversion_audit.json")
+    artifacts: Dict[str, Path] = {"conversion_audit": audit_path} if audit_path.is_file() else {}
     if conversion == "lanelet2_to_raster":
         from ..conversion.lanelet2_to_raster import raster_artifact_paths
 

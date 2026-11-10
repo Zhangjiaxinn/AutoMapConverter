@@ -30,11 +30,18 @@ def step_collection_1(file: str) -> Graph:
     return graph
 
 
-def step_collection_2(graph: Graph) -> Graph:
+def step_collection_2(graph: Graph, source_path=None) -> Graph:
     logging.info("linking lanes")
     lane_linker.link_graph(graph)
     if isinstance(graph, SublayeredGraph):
         lane_linker.link_graph(graph.sublayer_graph)
+    if source_path is not None:
+        from automap_converter.formats.osm.connectivity import apply_connectivity
+
+        records = apply_connectivity(graph, source_path)
+        for record in records:
+            if record["status"] == "WARN":
+                logging.warning("OSM connectivity %s: %s", record["relation"], record["detail"])
     logging.info("interpolating waypoints")
     graph.interpolate()
     logging.info("offsetting roads")
@@ -99,7 +106,7 @@ class GraphScenario:
         logging.info("reading File and creating graph")
 
         graph = step_collection_1(file)
-        graph = step_collection_2(graph)
+        graph = step_collection_2(graph, file)
 
         graph = step_collection_3(graph)
         self.graph: Graph = graph

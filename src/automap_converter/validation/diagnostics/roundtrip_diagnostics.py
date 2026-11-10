@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import time
 import traceback
 from collections import Counter, deque
@@ -14,16 +15,24 @@ from lxml import etree
 from shapely.geometry import LineString
 from shapely.strtree import STRtree
 
-from automap_converter.api.interface import (
-    lanelet2_to_opendrive,
-)
 from automap_converter.conversion.opendrive_to_commonroad.opendrive_conversion.network import (
     Network,
 )
 from automap_converter.core.config.general_config import general_config
-from automap_converter.core.config.lanelet2_config import lanelet2_config
 from automap_converter.core.config.opendrive_config import open_drive_config
+from automap_converter.core.traceability import (
+    LINEAGE,
+    coordinate_controls,
+    document_id,
+    extension,
+    metric_frame,
+    native_elements,
+    parse_xml,
+    read_frame,
+    transform_points,
+)
 from automap_converter.formats.opendrive.parser.parser import parse_opendrive
+from automap_converter.formats.lanelet2.geometry import orient_boundaries
 
 from ._workflow_runtime import (
     convert_lanelet2_to_osm,
@@ -44,6 +53,14 @@ class Feature:
     width: Optional[float]
     kind: str
     direction: str
+    left: List[Tuple[float, float]] = field(default_factory=list)
+    right: List[Tuple[float, float]] = field(default_factory=list)
+    attributes: dict = field(default_factory=dict)
+    ancestors: List[dict] = field(default_factory=list)
+    native_keys: List[str] = field(default_factory=list)
+    relations: dict = field(default_factory=dict)
+    rules: List[dict] = field(default_factory=list)
+    measurements: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -53,6 +70,9 @@ class FeatureSet:
     topology_edges: set[Tuple[str, str]] = field(default_factory=set)
     semantics: Counter = field(default_factory=Counter)
     geographic: bool = False
+    frame: dict = field(default_factory=dict)
+    document: str = ""
+    coordinate_checks: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -77,14 +97,8 @@ class RoundtripSpec:
 
 
 def _lanelet2_to_opendrive(source: Path, target: Path, _: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    lanelet2_config.adjacencies = True
-    lanelet2_to_opendrive(
-        str(source),
-        str(target),
-        lanelet_conf=lanelet2_config,
-        opendrive_conf=open_drive_config,
-    )
+    from ._workflow_runtime import convert_lanelet2_to_opendrive
+    convert_lanelet2_to_opendrive(source, target, _)
 
 
 def _opendrive_to_osm(source: Path, target: Path, intermediate_dir: Path) -> None:
@@ -191,6 +205,13 @@ DEFAULT_SCENARIOS = {
 }
 
 
+def _conversion_contract():
+    from automap_converter.api.settings import current_runtime_settings
+    if current_runtime_settings().osm_profile == "lanelet2-v1":
+        return "osm-lanelet2-profile/v1; public roads + declared native Lanelet2 detail; provenance identity-only"
+    return "native-format-semantics/v1; provenance identity-only; no reconstruction-profile fallback"
+
+
 def run_roundtrip(
     spec: RoundtripSpec,
     source: Path,
@@ -203,19 +224,16 @@ def run_roundtrip(
     intermediate_dir.mkdir(parents=True, exist_ok=True)
     middle_suffix = ".xodr" if spec.intermediate_format == "opendrive" else ".osm"
     middle = case_dir / f"01_{spec.intermediate_format}{middle_suffix}"
-    clean_middle = case_dir / f"02_{spec.intermediate_format}_standard_only{middle_suffix}"
     result_suffix = ".xodr" if spec.source_format == "opendrive" else ".osm"
     result = case_dir / f"03_roundtrip_{spec.source_format}{result_suffix}"
 
     payload: Dict[str, object] = {
-        "schema": "vector-map-roundtrip-diagnostics/v1",
+        "schema": "vector-map-roundtrip-diagnostics/v6",
         "case": spec.name,
         "pair": spec.pair,
         "source": _relative(source),
         "intermediate": _relative(middle),
-        "sanitized_intermediate": _relative(clean_middle),
         "roundtrip_target": _relative(result),
-        "anti_cheat": {},
         "pipeline": [],
         "metrics": [],
         "issues": [],
@@ -233,23 +251,18 @@ def run_roundtrip(
         current_stage = "first_conversion"
         spec.first(source, middle, intermediate_dir / "first")
         _record_stage(payload, current_stage, "PASS", _relative(middle))
-        current_stage = "provenance_sanitization"
-        removed = sanitize_intermediate(middle, clean_middle, spec.intermediate_format)
-        payload["anti_cheat"] = {
-            "status": "PASS",
-            "policy": (
-                "The reverse conversion receives a copy with lanelet2:/source:/conversion: "
-                "provenance removed. Matching never reads source IDs."
-            ),
-            "removed_fields": removed,
+        payload["lineage_policy"] = {
+            "matching": "Native conversion lineage, retained across both legs; no nearest-distance matching.",
+            "measurement": "Actual generated coordinates, boundaries, connectivity and attributes only.",
         }
-        _record_stage(payload, current_stage, "PASS", _relative(clean_middle))
+        payload["conversion_contract"] = _conversion_contract()
+        payload["sanitized_intermediate"] = None
         current_stage = "reverse_conversion"
-        spec.second(clean_middle, result, intermediate_dir / "second")
+        spec.second(middle, result, intermediate_dir / "second")
         _record_stage(payload, current_stage, "PASS", _relative(result))
         current_stage = "roundtrip_feature_extraction"
         result_features = extract_features(
-            result, spec.source_format, prefer_geographic=source_features.geographic
+            result, spec.source_format
         )
         _record_stage(payload, current_stage, "PASS")
         current_stage = "metric_comparison"
@@ -257,8 +270,29 @@ def run_roundtrip(
         payload.update(comparison)
         payload["target_inventory"] = inventory(result_features)
         payload["result"] = comparison["result"]
+        from .native_semantics import opendrive_speed_consistency
+        payload["native_semantic_checks"] = [
+            {"file": _relative(path), **opendrive_speed_consistency(path)}
+            for path, fmt in ((middle, spec.intermediate_format), (result, spec.source_format))
+            if fmt == "opendrive"
+        ]
+        if any(check["status"] == "FAIL" for check in payload["native_semantic_checks"]):
+            payload["result"] = "FAIL"
+            payload["issues"].append({
+                "category": "native-speed-consistency", "status": "FAIL",
+                "summary": "Generated native lane speed and applicable speed signal disagree.",
+            })
+        _record_stage(payload, "native_semantic_validation",
+                      "FAIL" if any(c["status"] == "FAIL" for c in payload["native_semantic_checks"]) else "PASS")
         _record_stage(payload, current_stage, str(comparison["result"]))
     except Exception as exc:
+        from ._roundtrip_contract import METRIC_NAMES
+        payload["metrics"] = [
+            {"name": name, "value": None, "pass_rate": None, "pass_rate_percent": None,
+             "passed": 0, "total": 0, "status": "FAIL",
+             "method": "Not measured: conversion/extraction failed; see failed_stage and error."}
+            for name in METRIC_NAMES
+        ]
         _record_stage(payload, current_stage, "FAIL", f"{type(exc).__name__}: {exc}")
         payload["issues"] = [
             {
@@ -327,7 +361,15 @@ def extract_features(
 
 def _extract_lanelet2(path: Path, prefer_geographic: Optional[bool] = None) -> FeatureSet:
     root = etree.parse(str(path)).getroot()
+    frame = read_frame(root, "lanelet2", fallback_id=document_id(path))
+    if prefer_geographic is None:
+        prefer_geographic = frame["kind"] == "geographic"
     nodes, geographic = _read_osm_nodes(root, prefer_geographic)
+    native_frame = frame
+    if geographic and nodes:
+        frame = metric_frame(native_frame, next(iter(nodes.values())))
+        nodes = dict(zip(nodes, transform_points(list(nodes.values()), native_frame, frame)))
+        geographic = False
     ways = {
         str(way.get("id", "")): [
             nodes[ref]
@@ -338,13 +380,6 @@ def _extract_lanelet2(path: Path, prefer_geographic: Optional[bool] = None) -> F
     }
     features: List[Feature] = []
     semantics = Counter()
-    way_usage = Counter(
-        member.get("ref")
-        for relation in root.findall("relation")
-        if _tags(relation).get("type") == "lanelet"
-        for member in relation.findall("member")
-        if member.get("role") in {"left", "right"} and member.get("ref")
-    )
     for relation in root.findall("relation"):
         tags = _tags(relation)
         relation_type = tags.get("type", "")
@@ -361,13 +396,8 @@ def _extract_lanelet2(path: Path, prefer_geographic: Optional[bool] = None) -> F
         right = ways.get(right_id, [])
         if len(left) < 2 or len(right) < 2:
             continue
-        if _distance(left[0], right[-1]) + _distance(left[-1], right[0]) < _distance(
-            left[0], right[0]
-        ) + _distance(left[-1], right[-1]):
-            if way_usage[left_id] >= way_usage[right_id]:
-                left = list(reversed(left))
-            else:
-                right = list(reversed(right))
+        lp, rp = orient_boundaries(LineString(left), LineString(right))
+        left, right = list(lp.coords), list(rp.coords)
         sample_count = max(8, min(40, max(len(left), len(right))))
         left_sample = _resample(left, sample_count)
         right_sample = _resample(right, sample_count)
@@ -375,6 +405,9 @@ def _extract_lanelet2(path: Path, prefer_geographic: Optional[bool] = None) -> F
             ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
             for a, b in zip(left_sample, right_sample)
         ]
+        center_id = next((m.get("ref") for m in members if m.get("role") == "centerline"), "")
+        if len(ways.get(center_id, [])) >= 2:
+            center = ways[center_id]
         widths = [
             _geographic_distance(a, b) if geographic else _distance(a, b)
             for a, b in zip(left_sample, right_sample)
@@ -385,7 +418,11 @@ def _extract_lanelet2(path: Path, prefer_geographic: Optional[bool] = None) -> F
                 points=center,
                 width=sum(widths) / len(widths),
                 kind=tags.get("subtype", tags.get("location", "road")),
-                direction=tags.get("one_way", "yes"),
+                direction=_direction_value(tags.get("one_way:vehicle", tags.get("one_way", tags.get("oneway", "yes")))),
+                left=left,
+                right=right,
+                attributes=_lanelet_attributes(root, relation),
+                rules=_lanelet_rules(root, relation, nodes),
             )
         )
     for way in root.findall("way"):
@@ -394,12 +431,18 @@ def _extract_lanelet2(path: Path, prefer_geographic: Optional[bool] = None) -> F
         if element_type in {"stop_line", "traffic_light", "traffic_sign"}:
             semantics[f"primitive:{element_type}"] += 1
     feature_set = FeatureSet("lanelet2", features, semantics=semantics, geographic=geographic)
-    feature_set.topology_edges = _infer_topology(features, geographic)
+    _decorate_features(feature_set, root, path, native_frame)
+    feature_set.frame = frame
+    _lanelet_relations(feature_set, root)
     return feature_set
 
 
 def _extract_osm(path: Path, prefer_geographic: Optional[bool] = None) -> FeatureSet:
+    from automap_converter.formats.osm.road_semantics import road_profile
     root = etree.parse(str(path)).getroot()
+    frame = read_frame(root, "osm", fallback_id=document_id(path))
+    if prefer_geographic is None:
+        prefer_geographic = frame["kind"] == "geographic"
     nodes, geographic = _read_osm_nodes(root, prefer_geographic)
     features: List[Feature] = []
     semantics = Counter()
@@ -416,9 +459,12 @@ def _extract_osm(path: Path, prefer_geographic: Optional[bool] = None) -> Featur
                 Feature(
                     key=str(way.get("id", "")),
                     points=points,
-                    width=_osm_width(tags),
+                    width=road_profile(tags)["width_m"],
                     kind=highway,
-                    direction=tags.get("oneway", "no"),
+                    direction=_direction_value(tags.get("oneway", "no")),
+                    attributes=_osm_attributes(root, way),
+                    rules=_osm_rules(root, way, nodes),
+                    measurements={k: road_profile(tags)[k] for k in ("width_basis", "estimated", "assumptions")},
                 )
             )
         semantics.update(_osm_semantic_categories(tags))
@@ -429,11 +475,38 @@ def _extract_osm(path: Path, prefer_geographic: Optional[bool] = None) -> Featur
         if tags.get("type") == "restriction":
             semantics[f"restriction:{tags.get('restriction', '<none>')}"] += 1
     feature_set = FeatureSet("osm", features, semantics=semantics, geographic=geographic)
-    feature_set.topology_edges = _infer_topology(features, geographic)
+    _decorate_features(feature_set, root, path, frame)
+    endpoints = {f.key: [n.get("ref") for n in root.find(f"way[@id='{f.key}']").findall("nd")]
+                 for f in features}
+    departures = {}
+    for feature in features:
+        refs = endpoints[feature.key]
+        outgoing = refs[:-1] if feature.direction in {"yes", "1", "true"} else refs[1:] if feature.direction == "-1" else refs
+        for node in outgoing:
+            departures.setdefault(node, set()).add(feature.key)
+    for feature in features:
+        refs = endpoints[feature.key]
+        incoming = refs[1:] if feature.direction in {"yes", "1", "true"} else refs[:-1] if feature.direction == "-1" else refs
+        for node in incoming:
+            for successor in departures.get(node, set()) - {feature.key}:
+                feature_set.topology_edges.add((feature.key, successor))
+    for relation in root.findall("relation"):
+        data = _tags(relation)
+        if data.get("type") != "restriction":
+            continue
+        members = relation.findall("member")
+        incoming = {m.get("ref") for m in members if m.get("role") == "from" and m.get("type") == "way"}
+        outgoing = {m.get("ref") for m in members if m.get("role") == "to" and m.get("type") == "way"}
+        if data.get("restriction", "").startswith("no_"):
+            feature_set.topology_edges -= {(a, b) for a in incoming for b in outgoing}
+        elif data.get("restriction", "").startswith("only_"):
+            feature_set.topology_edges = {(a, b) for a, b in feature_set.topology_edges if a not in incoming or b in outgoing}
     return feature_set
 
 
 def _extract_opendrive(path: Path) -> FeatureSet:
+    root = parse_xml(path).getroot()
+    elements = native_elements(root, "opendrive")
     opendrive = parse_opendrive(path)
     # Roundtrip geometry is compared in the native OpenDRIVE local frame.
     # geoReference is valid conversion metadata, but applying it here would
@@ -454,6 +527,20 @@ def _extract_opendrive(path: Path) -> FeatureSet:
         widths = [_distance(a, b) for a, b in zip(_resample(left, 20), _resample(right, 20))]
         lanelet_type = getattr(lanelet, "lanelet_type", set()) or set()
         kind = ",".join(sorted(str(item).split(".")[-1].lower() for item in lanelet_type)) or "driving"
+        native_keys = ["|".join(map(str, item)) for item in
+                       getattr(lanelet, "opendrive_lane_locations_detailed", set())]
+        if not native_keys and getattr(lanelet, "opendrive_road_id", None) is not None:
+            native_keys = ["|".join(str(getattr(lanelet, attr)) for attr in (
+                "opendrive_road_id", "opendrive_lane_section_id", "opendrive_lane_id"))]
+        if not native_keys and "crosswalk" in kind:
+            # The importer models crosswalk objects as lanelets; they are road
+            # objects, not additional native driving lanes for these measures.
+            continue
+        native = [elements[k] for k in native_keys if k in elements]
+        native_kinds = sorted({e.get("type", "driving") for e in native})
+        if native_kinds:
+            kind = ",".join(native_kinds)
+        ancestors = [ref for e in native for ref in (extension(e, LINEAGE) or {}).get("ancestors", [])]
         features.append(
             Feature(
                 key=key,
@@ -461,6 +548,16 @@ def _extract_opendrive(path: Path) -> FeatureSet:
                 width=sum(widths) / len(widths) if widths else None,
                 kind=kind,
                 direction="forward",
+                left=left,
+                right=right,
+                native_keys=native_keys,
+                ancestors=ancestors,
+                attributes=_opendrive_attributes(root, native_keys),
+                rules=_opendrive_rules(root, native_keys, opendrive),
+                relations={
+                    "left": [str(lanelet.adj_left)] if lanelet.adj_left is not None else [],
+                    "right": [str(lanelet.adj_right)] if lanelet.adj_right is not None else [],
+                },
             )
         )
     topology = set()
@@ -471,136 +568,260 @@ def _extract_opendrive(path: Path) -> FeatureSet:
         for successor in getattr(lanelet, "successor", []) or []:
             if successor in id_to_key:
                 topology.add((source_key, id_to_key[successor]))
-    if not topology:
-        topology = _infer_topology(features, False)
-    root = etree.parse(str(path)).getroot()
     semantics = Counter()
     for signal in root.xpath(".//*[local-name()='signal']"):
         semantics[f"signal:{_opendrive_signal_kind(signal)}"] += 1
     for obj in root.xpath(".//*[local-name()='object']"):
         semantics[f"object:{obj.get('type', '<none>')}"] += 1
-    return FeatureSet("opendrive", features, topology, semantics, False)
+    result = FeatureSet("opendrive", features, topology, semantics, False)
+    result.frame = read_frame(root, "opendrive", fallback_id=document_id(path))
+    result.document = document_id(path)
+    result.coordinate_checks = coordinate_controls(root, "opendrive", result.frame)
+    return result
+
+
+def _decorate_features(feature_set, root, path, frame):
+    feature_set.frame = frame
+    feature_set.document = document_id(path)
+    feature_set.coordinate_checks = coordinate_controls(root, feature_set.format, frame)
+    elements = native_elements(root, feature_set.format)
+    for feature in feature_set.features:
+        feature.native_keys = [feature.key]
+        element = elements.get(feature.key)
+        if element is not None:
+            feature.ancestors = (extension(element, LINEAGE) or {}).get("ancestors", [])
+
+
+def _lanelet_relations(feature_set, root):
+    relations = {r.get("id"): r for r in root.findall("relation")}
+    ways = {w.get("id"): [n.get("ref") for n in w.findall("nd")] for w in root.findall("way")}
+    bounds, endpoints, starts, ends = {}, {}, {}, {}
+    left_users, right_users = {}, {}
+    native_frame = read_frame(root, "lanelet2", fallback_id=feature_set.document)
+    node_points, _ = _read_osm_nodes(root, native_frame["kind"] == "geographic")
+    node_points = dict(zip(node_points, transform_points(list(node_points.values()), native_frame, feature_set.frame)))
+    for feature in feature_set.features:
+        relation = relations[feature.key]
+        left = next((m.get("ref") for m in relation.findall("member") if m.get("role") == "left"), "")
+        right = next((m.get("ref") for m in relation.findall("member") if m.get("role") == "right"), "")
+        bounds[feature.key] = (left, right)
+        left_nodes, right_nodes = ways.get(left, []), ways.get(right, [])
+        if left_nodes and right_nodes:
+            if feature.left and _distance(feature.left[0], node_points[left_nodes[0]]) > 1e-10:
+                left_nodes = list(reversed(left_nodes))
+            if feature.right and _distance(feature.right[0], node_points[right_nodes[0]]) > 1e-10:
+                right_nodes = list(reversed(right_nodes))
+            start, end = (left_nodes[0], right_nodes[0]), (left_nodes[-1], right_nodes[-1])
+            endpoints[feature.key] = (start, end)
+            starts.setdefault(start, []).append(feature.key)
+            ends.setdefault(end, []).append(feature.key)
+        left_users.setdefault(left, []).append(feature.key)
+        right_users.setdefault(right, []).append(feature.key)
+    # For native Lanelet2 files, topology is built from actual shared boundary
+    # objects/node IDs, never proximity of unrelated centerline endpoints.
+    for a in feature_set.features:
+        la, ra = bounds[a.key]
+        a.measurements["native_boundary_ids"] = {"left": la, "right": ra}
+        start, end = endpoints.get(a.key, (None, None))
+        a.relations = {
+            "predecessor": [k for k in ends.get(start, []) if k != a.key],
+            "successor": [k for k in starts.get(end, []) if k != a.key],
+            "left": sorted((set(left_users.get(la, []) + right_users.get(la, []))) - {a.key}),
+            "right": sorted((set(left_users.get(ra, []) + right_users.get(ra, []))) - {a.key}),
+        }
+    feature_set.topology_edges = {(f.key, k) for f in feature_set.features for k in f.relations.get("successor", [])}
+
+
+def _lanelet_attributes(root, relation):
+    rules = {}
+    for member in relation.findall("member"):
+        if member.get("role") != "regulatory_element":
+            continue
+        rule = root.find(f"relation[@id='{member.get('ref')}']")
+        if rule is None:
+            continue
+        rt = _tags(rule)
+        kind = rt.get("subtype", "")
+        if kind == "speed_limit":
+            value = _speed_value(rt.get("sign_type", rt.get("maxspeed", "")), "km/h")
+        elif kind == "traffic_light":
+            value = "traffic_light"
+        elif kind in {"right_of_way", "all_way_stop"}:
+            roles = sorted({m.get("role") for m in rule.findall("member") if m.get("ref") == relation.get("id")})
+            value = ",".join(roles) or kind
+        else:
+            continue
+        rules.setdefault("rule:" + kind, []).append(value)
+        if any(m.get("role") == "ref_line" for m in rule.findall("member")):
+            rules.setdefault("rule:stop_line", []).append("stop_line")
+    return {k: sorted(v) for k, v in rules.items()}
+
+
+def _osm_attributes(root, way):
+    from automap_converter.formats.osm.road_semantics import road_profile
+    data = _tags(way)
+    result = {k: data[k] for k in ("maxspeed", "turn:lanes") if k in data}
+    model = road_profile(data)
+    result["lanes"] = model["lanes"]
+    if model["highway"] not in {"footway", "path", "cycleway", "pedestrian", "steps"}:
+        result["lanes_forward"] = model["forward"]
+        result["lanes_backward"] = model["backward"]
+    if "maxspeed" in result:
+        result["maxspeed"] = _speed_value(result["maxspeed"], "km/h")
+    controls = []
+    for ref in way.findall("nd"):
+        node = root.find(f"node[@id='{ref.get('ref')}']")
+        if node is not None:
+            nt = _tags(node)
+            if nt.get("highway") in {"traffic_signals", "stop", "give_way", "crossing"}:
+                controls.append(nt["highway"])
+    if controls:
+        result["traffic_controls"] = sorted(controls)
+    restrictions = []
+    for relation in root.findall("relation"):
+        rt = _tags(relation)
+        if rt.get("type") == "restriction" and any(m.get("type") == "way" and m.get("ref") == way.get("id")
+                for m in relation.findall("member")):
+            restrictions.append(rt.get("restriction", ""))
+    if restrictions:
+        result["turn_restrictions"] = sorted(restrictions)
+    return result
+
+
+def _opendrive_attributes(root, keys):
+    attrs = {}
+    elements = native_elements(root, "opendrive")
+    for key in keys:
+        element = elements.get(key)
+        if element is None:
+            continue
+        road_id, _section, lane_id = key.split("|")
+        road = root.find(f"road[@id='{road_id}']")
+        speeds = element.findall("speed") or road.findall("type/speed")
+        if speeds:
+            attrs["speeds"] = sorted(_speed_value(s.get("max", ""), s.get("unit", "m/s")) for s in speeds)
+        signals = []
+        for signal in road.findall("signals/signal"):
+            validity = signal.findall("validity")
+            if validity and not any(int(v.get("fromLane")) <= int(lane_id) <= int(v.get("toLane")) for v in validity):
+                continue
+            signals.append((signal.get("type", ""), signal.get("subtype", ""),
+                            signal.get("value", ""), signal.get("unit", "")))
+        if signals:
+            attrs["signals"] = sorted(signals)
+        crossings = [o for o in road.findall("objects/object") if o.get("type") == "crosswalk"]
+        if crossings:
+            attrs["crosswalk_objects"] = sorted(o.get("type") for o in crossings)
+    return attrs
+
+
+def _object_points(root, element, nodes):
+    if element is None:
+        return []
+    if element.tag == "node":
+        return [nodes[element.get("id")]] if element.get("id") in nodes else []
+    return [nodes[n.get("ref")] for n in element.findall("nd") if n.get("ref") in nodes]
+
+
+def _direction_value(value):
+    value = str(value).strip().lower()
+    return {"1": "yes", "true": "yes", "0": "no", "false": "no"}.get(value, value)
+
+
+def _speed_value(value, default_unit):
+    text = str(value).strip().lower()
+    match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)\s*(km/?h|kmh|kph|m/s|mps|mph)?", text)
+    if not match:
+        return text
+    unit = match.group(2) or default_unit
+    multiplier = 1 / 3.6 if unit in {"km/h", "kmh", "kph"} else 0.44704 if unit == "mph" else 1.0
+    return f"{float(match.group(1)) * multiplier:.4f} m/s"
+
+
+def _lanelet_rules(root, relation, nodes):
+    from ._roundtrip_contract import SUPPORTED_RULES
+    result = []
+    for member in relation.findall("member"):
+        if member.get("role") != "regulatory_element":
+            continue
+        rule = root.find(f"relation[@id='{member.get('ref')}']")
+        if rule is None:
+            continue
+        data = _tags(rule)
+        kind = data.get("subtype", "")
+        if kind not in SUPPORTED_RULES and kind != "all_way_stop":
+            continue
+        for ref in rule.findall("member"):
+            role = ref.get("role")
+            if role not in {"refers", "ref_line"}:
+                continue
+            element = root.find(f"{ref.get('type')}[@id='{ref.get('ref')}']")
+            points = _object_points(root, element, nodes)
+            if points:
+                result.append({"kind": "stop_line" if role == "ref_line" else kind,
+                               "points": points, "value": (_speed_value(data.get("sign_type", ""), "m/s")
+                                                            if kind == "speed_limit" else data.get("sign_type", ""))})
+    return result
+
+
+def _osm_rules(root, way, nodes):
+    result = []
+    for ref in way.findall("nd"):
+        node = root.find(f"node[@id='{ref.get('ref')}']")
+        if node is None:
+            continue
+        data = _tags(node)
+        kind = {"traffic_signals": "traffic_light", "stop": "stop", "give_way": "yield",
+                "crossing": "crosswalk"}.get(data.get("highway"))
+        if kind and ref.get("ref") in nodes:
+            result.append({"kind": kind, "value": "", "points": [nodes[ref.get("ref")]]})
+    return result
+
+
+def _opendrive_rules(root, keys, parsed):
+    result = []
+    for key in keys:
+        road_id, section_index, lane_id = key.split("|")
+        road = root.find(f"road[@id='{road_id}']")
+        if road is None:
+            continue
+        sections = road.findall("lanes/laneSection")
+        start = float(sections[int(section_index)].get("s"))
+        end = float(sections[int(section_index) + 1].get("s")) if int(section_index) + 1 < len(sections) else float(road.get("length"))
+        parsed_road = next((r for r in parsed.roads if str(r.id) == road_id), None)
+        if parsed_road is None:
+            continue
+        for signal in road.findall("signals/signal"):
+            s, t = float(signal.get("s", "0")), float(signal.get("t", "0"))
+            if not start <= s <= end:
+                continue
+            validity = signal.findall("validity")
+            if validity and not any(int(v.get("fromLane")) <= int(lane_id) <= int(v.get("toLane")) for v in validity):
+                continue
+            kind = _opendrive_signal_kind(signal)
+            if kind not in {"traffic_light", "right_of_way", "speed_limit", "stop_line"}:
+                continue
+            p, heading, _, _ = parsed_road.plan_view.calc(s, compute_curvature=False)
+            point = (float(p[0] - t * math.sin(heading)), float(p[1] + t * math.cos(heading)))
+            value = signal.get("value", "")
+            if kind == "speed_limit":
+                value = _speed_value(value, signal.get("unit", "m/s"))
+            result.append({"kind": kind, "points": [point], "value": value})
+        for obj in road.findall("objects/object"):
+            if obj.get("type") != "crosswalk":
+                continue
+            s, t = float(obj.get("s", "0")), float(obj.get("t", "0"))
+            if not start <= s <= end:
+                continue
+            p, heading, _, _ = parsed_road.plan_view.calc(s, compute_curvature=False)
+            result.append({"kind": "crosswalk", "value": "",
+                           "points": [(float(p[0] - t * math.sin(heading)), float(p[1] + t * math.cos(heading)))]})
+    return result
 
 
 def compare_feature_sets(source: FeatureSet, target: FeatureSet) -> Dict[str, object]:
-    if source.geographic != target.geographic:
-        raise ValueError(
-            "Source and roundtrip target use incompatible local/geographic coordinate representations."
-        )
-    source_points, target_points = _metric_feature_points(source, target)
-    matches = _match_features(source, target, source_points, target_points)
-    accepted = [match for match in matches if match.mean_error_m <= 5.0]
-    mapping = {match.source_index: match.target_index for match in accepted}
-    geometry_errors = [match.mean_error_m for match in accepted]
-    width_errors = []
-    attribute_matches = 0
-    attribute_total = 0
-    for match in accepted:
-        src = source.features[match.source_index]
-        dst = target.features[match.target_index]
-        if src.width is not None and src.width > 1e-6 and dst.width is not None:
-            width_errors.append(abs(src.width - dst.width) / src.width)
-        attribute_total += 2
-        attribute_matches += int(_kind_equal(src.kind, dst.kind))
-        direction_equal = src.direction == dst.direction
-        if src.direction in {"yes", "1", "true", "forward"}:
-            direction_equal = direction_equal and match.orientation_preserved
-        attribute_matches += int(direction_equal)
-
-    retained_edges, missing_edges = _retained_topology_edges(
-        source, target, mapping, max_hops=3
-    )
-    semantic_total = sum(source.semantics.values())
-    semantic_retained = sum(
-        min(count, target.semantics.get(category, 0))
-        for category, count in source.semantics.items()
-    )
-    metrics = [
-        _metric(
-            "feature_coverage",
-            len(accepted) / len(source.features) if source.features else 1.0,
-            0.85,
-            ">=",
-            "Ratio of source lanes/roads with a geometry match within 5 m.",
-        ),
-        _metric(
-            "centerline_mean_error_m",
-            sum(geometry_errors) / len(geometry_errors) if geometry_errors else math.inf,
-            1.0,
-            "<=",
-            "Mean point distance after equal-distance resampling; no ID/provenance matching.",
-        ),
-        _metric(
-            "lane_width_mean_relative_error",
-            sum(width_errors) / len(width_errors) if width_errors else None,
-            0.10,
-            "<=",
-            "Mean relative error of matched lane/road widths.",
-        ),
-        _metric(
-            "topology_edge_match_rate",
-            retained_edges / len(source.topology_edges) if source.topology_edges else None,
-            0.85,
-            ">=",
-            "Source predecessor/successor edges retained directly, by merge, or within 3 target hops.",
-        ),
-        _metric(
-            "type_direction_attribute_match_rate",
-            attribute_matches / attribute_total if attribute_total else None,
-            0.85,
-            ">=",
-            "Matched lane/road type and travel direction agreement.",
-        ),
-        _metric(
-            "semantic_element_retention_rate",
-            semantic_retained / semantic_total if semantic_total else None,
-            0.85,
-            ">=",
-            "Traffic-rule and area/object category count retained without source-only metadata.",
-        ),
-    ]
-    failed = [metric for metric in metrics if metric["status"] == "FAIL"]
-    unmatched = [
-        {
-            "source_key": source.features[index].key,
-            "nearest_error_m": round(matches[index].mean_error_m, 6) if index < len(matches) else None,
-        }
-        for index in range(len(source.features))
-        if index not in mapping
-    ]
-    worst = sorted(accepted, key=lambda item: item.mean_error_m, reverse=True)[:25]
-    issues = [
-        {
-            "category": metric["name"],
-            "status": "FAIL",
-            "summary": (
-                f"actual={metric['value']} does not satisfy "
-                f"{metric['operator']} {metric['threshold']}"
-            ),
-        }
-        for metric in failed
-    ]
-    return {
-        "result": "PASS" if not failed else "FAIL",
-        "metrics": metrics,
-        "issues": issues,
-        "evidence": {
-            "matched_features": len(accepted),
-            "unmatched_source_features": unmatched[:500],
-            "worst_geometry_matches": [
-                {
-                    "source_key": source.features[item.source_index].key,
-                    "target_key": target.features[item.target_index].key,
-                    "mean_error_m": round(item.mean_error_m, 6),
-                    "orientation_preserved": item.orientation_preserved,
-                }
-                for item in worst
-            ],
-            "missing_topology_edges": missing_edges[:500],
-            "source_semantics": dict(source.semantics),
-            "target_semantics": dict(target.semantics),
-        },
-    }
+    from ._roundtrip_contract import compare
+    return compare(source, target)
 
 
 def _metric(
@@ -999,7 +1220,8 @@ def write_summary(output_dir: Path, rows: Sequence[Dict[str, object]]) -> Tuple[
             "pass_rate": round(pair_passed / len(pair_rows), 6) if pair_rows else 0.0,
         }
     payload = {
-        "schema": "vector-map-roundtrip-summary/v1",
+        "schema": "vector-map-roundtrip-summary/v6",
+        "conversion_contract": _conversion_contract(),
         "total": total,
         "passed": passed,
         "failed": total - passed,
@@ -1015,7 +1237,7 @@ def write_summary(output_dir: Path, rows: Sequence[Dict[str, object]]) -> Tuple[
         "=" * 100,
         f"Total={total} PASS={passed} FAIL={total - passed} PassRate={payload['pass_rate']:.2%}",
         "",
-        "Result  Roundtrip                              Map                              Failed metrics",
+        "Result  Roundtrip                              Map                              LineMeans   Width       Topology    Attributes  Failed metrics",
         "-" * 100,
     ]
     for pair, values in pair_totals.items():
@@ -1025,6 +1247,12 @@ def write_summary(output_dir: Path, rows: Sequence[Dict[str, object]]) -> Tuple[
             f"PassRate={values['pass_rate']:.2%}",
         )
     for row in rows:
+        from ._roundtrip_contract import METRIC_NAMES
+        by_name = {m["name"]: m for m in row.get("metrics", [])}
+        percentages = [
+            (f"{by_name[name]['pass_rate']:.2%}" if by_name.get(name, {}).get("pass_rate") is not None
+             else "N/A") for name in METRIC_NAMES
+        ]
         failed_metrics = ",".join(
             str(metric.get("name"))
             for metric in row.get("metrics", [])
@@ -1035,9 +1263,27 @@ def write_summary(output_dir: Path, rows: Sequence[Dict[str, object]]) -> Tuple[
         lines.append(
             f"{str(row.get('result', 'FAIL')):<7} "
             f"{str(row.get('case', '')):<38} "
-            f"{Path(str(row.get('source', ''))).name:<32} {failed_metrics or '-'}"
+            f"{Path(str(row.get('source', ''))).name:<32} "
+            + " ".join(f"{p:<11}" for p in percentages) + f" {failed_metrics or '-'}"
         )
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    markdown = ["# Roundtrip Test-Plan Results", "",
+                "Contract: " + _conversion_contract(), "",
+                "| Route | Map | Line means <=1m | Width <=10% | Topology | Attributes | Result |",
+                "| --- | --- | ---: | ---: | ---: | ---: | --- |"]
+    for row in rows:
+        by_name = {m["name"]: m for m in row.get("metrics", [])}
+        values = [(f"{by_name[name]['pass_rate']:.2%}" if by_name.get(name, {}).get("pass_rate") is not None
+                   else "N/A") for name in METRIC_NAMES]
+        markdown.append("| " + " | ".join([
+            str(row.get("case", "")), Path(str(row.get("source", ""))).name,
+            *values, str(row.get("result", "FAIL"))]) + " |")
+    markdown.extend(["", "N/A means no applicable source samples, or an execution error (see JSON).",
+                     "Coordinate pass rate counts source lines whose mean paired-point error is <=1m; acceptance requires 100% of source-line means to pass. Individual point errors remain evidence only.",
+                     "Width acceptance requires every sampled applicable section <=10%; topology/attributes >=85%.",
+                     "Lanelet2 lateral matches additionally require actual native shared-boundary intervals at all five fixed source stations. Raw graph matches and full-interval coverage are retained as evidence.",
+                     "Functional equivalence requires separate viewer/routing/simulation review."])
+    (output_dir / "summary.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
     return txt_path, json_path
 
 
@@ -1050,13 +1296,13 @@ def _relative(path: Path) -> str:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run provenance-free A -> B -> A vector-map consistency tests."
+        description="Run lineage-based A -> B -> A' tests using four test-plan measures."
     )
     parser.add_argument(
         "--case",
         choices=["all", *SPECS.keys()],
         default="all",
-        help="Roundtrip direction to test. Default: all four directions.",
+        help="Roundtrip direction to test. Default: all six vector directions.",
     )
     parser.add_argument("--source", default="", help="Optional single source map for one case.")
     parser.add_argument("--source-dir", default="", help="Optional source directory override.")

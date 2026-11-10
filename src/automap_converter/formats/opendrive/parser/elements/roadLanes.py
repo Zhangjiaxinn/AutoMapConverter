@@ -150,6 +150,7 @@ class Lane:
     laneTypes = [
         "none",
         "driving",
+        "bus",
         "stop",
         "shoulder",
         "biking",

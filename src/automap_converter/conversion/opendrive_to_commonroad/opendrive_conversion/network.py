@@ -323,7 +323,7 @@ class Network:
                         if unit_speed == "km/h":
                             max_speed = max_speed * 0.277
                         elif unit_speed == "mph":
-                            max_speed = max_speed * 0.447
+                            max_speed = max_speed * 0.44704
 
                         # assign the road speed limit to all road sections that don't have a speed limit
                         for section in road.lanes.lane_sections:
@@ -613,10 +613,10 @@ class Network:
                                 if (
                                     sign.traffic_sign_id not in update_lane.traffic_signs
                                     and self.get_traffic_sign_with_equal_speed(
-                                        update_lane, lanelet_network, speeds[0] is None
-                                    )
+                                        update_lane, lanelet_network, speeds[0]
+                                    ) is None
                                 ):
-                                    update_lane_id.add_traffic_sign_to_lanelet(sign.traffic_sign_id)
+                                    update_lane.add_traffic_sign_to_lanelet(sign.traffic_sign_id)
                             break
                     break
 
@@ -634,7 +634,7 @@ class Network:
             lane = lanelet_network.find_lanelet_by_id(lane)
             visited.append(lane.lanelet_id)
             if lane.speed is None:
-                break
+                continue
             for pred in lane.predecessor:
                 if lanelet_network.find_lanelet_by_id(pred).speed != lane.speed:
                     self.add_virtual_traffic_sign(lane, lanelet_network)

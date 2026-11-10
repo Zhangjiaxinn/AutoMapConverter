@@ -514,7 +514,7 @@ def parse_opendrive_road_lane_section(
                 if unit == "km/h":
                     new_lane.speed = float(lane.find("speed").get("max")) / 3.6
                 elif unit == "mph":
-                    new_lane.speed = float(lane.find("speed").get("max")) / 2.237
+                    new_lane.speed = float(lane.find("speed").get("max")) * 0.44704
             else:
                 new_lane.speed = None
 

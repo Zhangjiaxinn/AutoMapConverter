@@ -272,7 +272,10 @@ class CR2LaneletConverter:
         if self._config.autoware is True:
             self._append_lane_change_tags()
 
-        return self.osm.serialize_to_xml()
+        from automap_converter.formats.lanelet2.shared_geometry import consolidate_shared_geometry
+        result=self.osm.serialize_to_xml()
+        consolidate_shared_geometry(result)
+        return result
 
     def _add_regulatory_element_for_traffic_lights(self):
         """
@@ -400,7 +403,7 @@ class CR2LaneletConverter:
 
         if self._config.use_local_coordinates:
             localx1, localy1 = light.position[0], light.position[1]
-            localx2, localy2 = light.position[0] - 0.1, light.position[1] + 0.1
+            localx2, localy2 = light.position[0] + 0.1, light.position[1] + 0.1
             localx3, localy3 = light.position[0] - 0.1, light.position[1] - 0.1
         self.osm.add_node(
             Node(id1, lat1, lon1, z, autoware=autoware, local_x=localx1, local_y=localy1)
@@ -418,6 +421,8 @@ class CR2LaneletConverter:
         for col in light.color:
             traffic_light_subtype += f"{col.value}_"
         traffic_light_subtype = traffic_light_subtype[:-1]
+        signal_tags = ({"source:opendrive:signal": light.opendrive_signal_key}
+                       if getattr(light, "opendrive_signal_key", None) else {})
         # traffic_light_subtype = light.traffic_light_cycle.cycle_elements[0].state.value
         # Autoware supports that traffic lights only consist of 2 nodes instead of 3
         if autoware:
@@ -426,6 +431,7 @@ class CR2LaneletConverter:
                     traffic_light_id,
                     [id1, id2],
                     tag_dict={
+                        **signal_tags,
                         "subtype": traffic_light_subtype,
                         "type": "traffic_light",
                         "height": "1.2",
@@ -437,7 +443,7 @@ class CR2LaneletConverter:
                 Way(
                     traffic_light_id,
                     [id1, id2, id3],
-                    tag_dict={"subtype": traffic_light_subtype, "type": "traffic_light"},
+                    tag_dict={**signal_tags, "subtype": traffic_light_subtype, "type": "traffic_light"},
                 )
             )
 
@@ -570,10 +576,14 @@ class CR2LaneletConverter:
 
                 # create nodes from the points and add them to the osm
                 node_start = Node(
-                    self.id_count, lat_start, lon_start, z_start, autoware=self._config.autoware
+                    self.id_count, lat_start, lon_start, z_start, autoware=self._config.autoware,
+                    local_x=stop_line_start[0] if self._config.use_local_coordinates else None,
+                    local_y=stop_line_start[1] if self._config.use_local_coordinates else None,
                 )
                 node_end = Node(
-                    self.id_count, lat_end, lon_end, z_end, autoware=self._config.autoware
+                    self.id_count, lat_end, lon_end, z_end, autoware=self._config.autoware,
+                    local_x=stop_line_end[0] if self._config.use_local_coordinates else None,
+                    local_y=stop_line_end[1] if self._config.use_local_coordinates else None,
                 )
                 self.osm.add_node(node_start)
                 self.osm.add_node(node_end)
@@ -660,8 +670,12 @@ class CR2LaneletConverter:
             z = sign.position[2]
 
         # creating and adding those nodes to our osm
-        self.osm.add_node(Node(id1, lat_1, lon_1, z, autoware=self._config.autoware))
-        self.osm.add_node(Node(id2, lat_2, lon_2, z, autoware=self._config.autoware))
+        self.osm.add_node(Node(id1, lat_1, lon_1, z, autoware=self._config.autoware,
+                               local_x=sign.position[0] if self._config.use_local_coordinates else None,
+                               local_y=sign.position[1] if self._config.use_local_coordinates else None))
+        self.osm.add_node(Node(id2, lat_2, lon_2, z, autoware=self._config.autoware,
+                               local_x=sign.position[0] + .25 if self._config.use_local_coordinates else None,
+                               local_y=sign.position[1] + .25 if self._config.use_local_coordinates else None))
 
         # matching the type of the traffic sign
         sign_id = sign.traffic_sign_elements[0].traffic_sign_element_id
@@ -690,6 +704,8 @@ class CR2LaneletConverter:
             "type": "traffic_sign",
             "virtual": str(virtual),
         }
+        if getattr(sign, "opendrive_signal_key", None):
+            tag_dict["source:opendrive:signal"] = sign.opendrive_signal_key
         self.osm.add_way(
             Way(traffic_sign_wayid, [id1, id2], tag_dict=tag_dict)
         )
@@ -765,6 +781,18 @@ class CR2LaneletConverter:
         # set the overriding tags for bidirectional users
         _set_overriding_tags_for_bidirectional_users(lanelet, way_rel)
         self._append_opendrive_source_tags(lanelet, way_rel)
+        osm_sources = getattr(lanelet, "osm_source_way_ids", set())
+        if osm_sources:
+            way_rel.tag_dict["source:osm:ways"] = ",".join(sorted(osm_sources))
+        if getattr(lanelet, "osm_road_model", None):
+            model = lanelet.osm_road_model
+            if not model.get("connector"):
+                way_rel.tag_dict["source:osm:lane_index"] = str(model.get("lane_index", 1))
+                way_rel.tag_dict["source:osm:forward"] = (
+                    "yes" if model.get("forward_lane", True) else "no"
+                )
+            else:
+                way_rel.tag_dict["source:osm:generated_connector"] = "yes"
 
         # add the way relation to the osm
         self.osm.add_way_relation(way_rel)
@@ -1164,7 +1192,7 @@ class CR2LaneletConverter:
                         speed_sign_id,
                         refers=refers,
                         tag_dict={
-                            "sign_type": max_speed,
+                            "sign_type": f"{max_speed} m/s" if max_speed else "",
                             "subtype": "speed_limit",
                             "type": "regulatory_element",
                         },

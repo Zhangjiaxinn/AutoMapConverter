@@ -73,6 +73,8 @@ class Edge:
         self.traffic_signs = traffic_signs
         self.traffic_lights = traffic_lights
         self.edge_type = edge_type
+        self.osm_source_way_ids = set()
+        self.osm_road_model = {}
 
     def is_valid(self, lanelet) -> bool:
         """
@@ -110,6 +112,8 @@ class Edge:
             line_marking_right_vertices=LineMarking.UNKNOWN,
         )
         self.is_valid(lanelet)
+        lanelet.osm_source_way_ids = set(self.osm_source_way_ids)
+        lanelet.osm_road_model = dict(self.osm_road_model)
         return lanelet
 
     @staticmethod
@@ -161,7 +165,7 @@ class Edge:
         from_node = Node(lane.from_node.id, lane.from_node.get_point())
         to_node = Node(lane.to_node.id, lane.to_node.get_point())
 
-        return Edge(
+        result = Edge(
             current_id,
             from_node,
             to_node,
@@ -177,3 +181,22 @@ class Edge:
             traffic_signs,
             traffic_lights,
         )
+        # Connector lanes are generated from their incident road lanes.
+        parents = [lane] if lane.edge is not None else list(lane.predecessors | lane.successors)
+        result.osm_source_way_ids = {
+            way_id for parent in parents if parent.edge is not None
+            for way_id in getattr(parent.edge, "osm_source_way_ids", set())
+        }
+        if lane.edge is not None:
+            directed=[l for l in lane.edge.lanes if l.forward==lane.forward]
+            if not lane.forward:
+                directed.reverse()
+            result.osm_road_model = {**getattr(lane.edge, "osm_road_model", {}),
+                                    "forward_lane": bool(lane.forward), "connector": False,
+                                    "lane_index":directed.index(lane)+1}
+        else:
+            models = [getattr(p.edge, "osm_road_model", {}) for p in parents if p.edge is not None]
+            if models and len(result.osm_source_way_ids) == 1:
+                result.osm_road_model = {**models[0], "connector": True,
+                                        "forward_lane": bool(next(iter(lane.predecessors)).forward) if lane.predecessors else True}
+        return result

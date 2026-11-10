@@ -32,7 +32,11 @@ PathLike = Union[str, Path]
 
 
 def _parse_lanelet2(input_file: PathLike, lanelet_conf: Lanelet2Config):
-    return Lanelet2Parser(etree.parse(str(input_file)).getroot(), lanelet_conf).parse()
+    from automap_converter.core.traceability import read_frame, document_id
+    root = etree.parse(str(input_file)).getroot()
+    result = Lanelet2Parser(root, lanelet_conf).parse()
+    result.coordinate_frame = read_frame(root, "lanelet2", fallback_id=document_id(Path(input_file)))
+    return result
 
 
 def _enrich_lanelet2_topology(
@@ -44,24 +48,27 @@ def _enrich_lanelet2_topology(
 ) -> None:
     """Prefer official routing topology when available; retain parsed fallback."""
 
-    if not enabled:
-        return
-    try:
-        enrich_topology_from_official_routing_graph(
-            osm_lanelet=lanelet_map,
-            osm_file_path=str(input_file),
-            origin_lat=float(lanelet_conf.routing_origin_lat),
-            origin_lon=float(lanelet_conf.routing_origin_lon),
-            location=str(lanelet_conf.routing_location),
-            participant=str(lanelet_conf.routing_participant),
-            overwrite=True,
-        )
-    except Exception as exc:  # routing plugins remain optional
-        logging.warning(
-            "Lanelet2 routing enrichment failed for %s; parser topology is retained. Reason: %s",
-            input_file,
-            exc,
-        )
+    if enabled:
+        try:
+            enrich_topology_from_official_routing_graph(
+                osm_lanelet=lanelet_map,
+                osm_file_path=str(input_file),
+                origin_lat=float(lanelet_conf.routing_origin_lat),
+                origin_lon=float(lanelet_conf.routing_origin_lon),
+                location=str(lanelet_conf.routing_location),
+                participant=str(lanelet_conf.routing_participant),
+                overwrite=True,
+            )
+        except Exception as exc:  # routing plugins remain optional
+            logging.warning(
+                "Lanelet2 routing enrichment failed for %s; parser topology is retained. Reason: %s",
+                input_file,
+                exc,
+            )
+    # Routing permissions can exclude nonmotor lanes. Recover physical relations
+    # from this input's actual shared ways and endpoints, never private tags.
+    from automap_converter.formats.lanelet2.shared_geometry import native_relations
+    native_relations(lanelet_map)
 
 
 def lanelet2_to_commonroad(
@@ -138,10 +145,16 @@ def commonroad_file_to_lanelet2(
     *,
     lanelet_conf: Lanelet2Config = lanelet2_config,
     general_conf: GeneralConfig = general_config,
+    osm_source_way_ids: dict[str, set[str]] | None = None,
+    osm_road_models: dict[str, dict] | None = None,
 ) -> Path:
     """Read a CommonRoad file and serialize its scenario as Lanelet2."""
 
     scenario, _ = CommonRoadFileReader(str(input_file)).open()
+    if osm_source_way_ids is not None:
+        for lanelet in scenario.lanelet_network.lanelets:
+            lanelet.osm_source_way_ids = set(osm_source_way_ids.get(str(lanelet.lanelet_id), set()))
+            lanelet.osm_road_model = dict((osm_road_models or {}).get(str(lanelet.lanelet_id), {}))
     return commonroad_to_lanelet2(
         scenario, output_file, lanelet_conf=lanelet_conf, general_conf=general_conf
     )

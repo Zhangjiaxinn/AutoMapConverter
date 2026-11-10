@@ -191,6 +191,7 @@ def assign_traffic_signals_to_road(
                 virtual=False,
             )
             road.add_traffic_sign((traffic_sign, lanes, signal.s))
+            traffic_sign.opendrive_signal_key = f"{road.id}|signal|{signal.signal_id}"
             traffic_signs.append(traffic_sign)
 
         elif signal.dynamic == "yes":
@@ -228,6 +229,7 @@ def assign_traffic_signals_to_road(
                 direction=tdir,
             )  # TODO remove for new CR-Format
             road.add_traffic_light((traffic_light, lanes, signal.s))
+            traffic_light.opendrive_signal_key = f"{road.id}|signal|{signal.signal_id}"
             traffic_lights.append(traffic_light)
     return traffic_lights, traffic_signs, stop_lines
 

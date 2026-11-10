@@ -414,6 +414,14 @@ class ConversionLaneletNetwork(LaneletNetwork):
         :return: A list of pairs of lanelets which can be concatenated. None if it is not possible.
         """
         mergeable_lanelets = []
+        # A native road boundary carries junction and provenance semantics.
+        # Independent directional merges across roads destroy cross-section groups.
+        road_id = getattr(lanelet,"opendrive_road_id",None)
+        if road_id is not None and any(
+            getattr(self.find_lanelet_by_id(k),"opendrive_road_id",None)!=road_id
+            for k in lanelet.successor
+        ):
+            return None
 
         # neglect conflicting references (references pointing to each other) since this can cause errors in later processing steps when working with references
         if (
